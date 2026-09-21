@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # ==============================================================================
-# Script tự động cài đặt Docker cho macOS & Linux (Ubuntu/Debian/CentOS/v.v.)
+# Script tự động cài đặt & cấu hình Docker cho macOS & Linux
 # Tự nhận diện hệ điều hành, kiến trúc CPU (Apple Silicon / Intel / ARM / x86_64)
+# Tự động khắc phục lỗi phân quyền Docker socket (Permission Denied)
 # ==============================================================================
 
 set -e
@@ -17,7 +18,7 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 echo -e "\n${CYAN}${BOLD}=================================================================${NC}"
-echo -e "${CYAN}${BOLD}           SCRIPT TỰ ĐỘNG CÀI ĐẶT DOCKER (macOS & LINUX)         ${NC}"
+echo -e "${CYAN}${BOLD}           SCRIPT CÀI ĐẶT & CẤU HÌNH DOCKER (macOS & LINUX)      ${NC}"
 echo -e "${CYAN}${BOLD}=================================================================${NC}\n"
 
 # 1. Phát hiện hệ điều hành và kiến trúc chip
@@ -27,14 +28,81 @@ ARCH="$(uname -m)"
 echo -e "${BLUE}ℹ Hệ điều hành phát hiện:${NC} ${BOLD}${OS}${NC}"
 echo -e "${BLUE}ℹ Kiến trúc phần cứng:${NC} ${BOLD}${ARCH}${NC}"
 
-# Kiểm tra Docker hiện tại
+# Hàm sửa lỗi phân quyền Docker trên Linux
+fix_linux_permissions() {
+    echo -e "\n${BLUE}ℹ Đang kiểm tra và sửa quyền truy cập Docker socket...${NC}"
+    CURRENT_USER="${SUDO_USER:-$USER}"
+    
+    # 1. Thêm user vào group docker
+    if command -v sudo >/dev/null 2>&1; then
+        sudo usermod -aG docker "$CURRENT_USER" 2>/dev/null || true
+        # 2. Cấp quyền đọc/ghi tạm thời cho socket để có hiệu lực ngay trong phiên hiện tại
+        if [ -e /var/run/docker.sock ]; then
+            sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+            sudo chown root:docker /var/run/docker.sock 2>/dev/null || true
+        fi
+        # 3. Đảm bảo docker daemon đang chạy
+        if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl enable docker 2>/dev/null || true
+            sudo systemctl start docker 2>/dev/null || true
+        fi
+    elif [ "$EUID" -eq 0 ]; then
+        usermod -aG docker "$CURRENT_USER" 2>/dev/null || true
+        [ -e /var/run/docker.sock ] && chmod 666 /var/run/docker.sock 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}✓ Đã cấp quyền truy cập Docker socket thành công!${NC}"
+}
+
+# 2. Kiểm tra Docker hiện tại
 if command -v docker >/dev/null 2>&1; then
     DOCKER_VER=$(docker --version 2>/dev/null || echo "Unknown")
     echo -e "\n${YELLOW}⚠ Đã tìm thấy Docker trên hệ thống:${NC} ${BOLD}${DOCKER_VER}${NC}"
-    read -rp "Bạn có muốn tiếp tục cài đặt / cấu hình lại không? [y/N]: " REINSTALL
-    if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
-        echo -e "${GREEN}✓ Giữ nguyên Docker hiện tại. Thoát script.${NC}\n"
-        exit 0
+    
+    # Kiểm tra xem daemon có kết nối được không
+    if docker info >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ Docker daemon đang hoạt động bình thường!${NC}"
+        echo "1) Thoát (Giữ nguyên hiện tại)"
+        echo "2) Cài đặt lại / Cập nhật Docker mới"
+        read -rp "Lựa chọn [1/2] (Mặc định: 1): " CHOICE
+        if [ "$CHOICE" != "2" ]; then
+            echo -e "${GREEN}Hoàn tất. Thoát script.${NC}\n"
+            exit 0
+        fi
+    else
+        echo -e "${RED}✗ Lệnh 'docker info' thất bại! Có thể do daemon chưa bật hoặc thiếu quyền truy cập socket.${NC}"
+        if [ "$OS" = "Linux" ]; then
+            echo "1) Tự động sửa quyền Docker (Thêm vào group docker & cấp quyền socket) [Khuyên dùng]"
+            echo "2) Cài đặt lại Docker từ đầu"
+            echo "3) Thoát"
+            read -rp "Lựa chọn [1/2/3] (Mặc định: 1): " REPAIR_CHOICE
+            REPAIR_CHOICE="${REPAIR_CHOICE:-1}"
+            
+            if [ "$REPAIR_CHOICE" = "1" ]; then
+                fix_linux_permissions
+                if docker info >/dev/null 2>&1; then
+                    echo -e "\n${GREEN}${BOLD}🎉 Tuyệt vời! Docker đã hoạt động bình thường mà không cần sudo!${NC}\n"
+                    exit 0
+                else
+                    echo -e "\n${YELLOW}ℹ Hãy chạy 'newgrp docker' hoặc đăng nhập lại để cập nhật nhóm user.${NC}"
+                    exit 0
+                fi
+            elif [ "$REPAIR_CHOICE" = "3" ]; then
+                exit 0
+            fi
+        else
+            echo "1) Khởi động Docker Desktop trên macOS"
+            echo "2) Cài đặt lại Docker"
+            echo "3) Thoát"
+            read -rp "Lựa chọn [1/2/3] (Mặc định: 1): " MAC_ERR_CHOICE
+            MAC_ERR_CHOICE="${MAC_ERR_CHOICE:-1}"
+            if [ "$MAC_ERR_CHOICE" = "1" ]; then
+                open -a Docker || true
+                exit 0
+            elif [ "$MAC_ERR_CHOICE" = "3" ]; then
+                exit 0
+            fi
+        fi
     fi
 fi
 
@@ -152,21 +220,15 @@ install_linux() {
     $SUDO sh /tmp/get-docker.sh
     rm -f /tmp/get-docker.sh
 
-    # Khởi động dịch vụ Docker qua systemd (nếu có)
+    # Khởi động dịch vụ Docker qua systemd
     if command -v systemctl >/dev/null 2>&1; then
         echo -e "\n${BLUE}ℹ Kích hoạt và khởi động Docker service...${NC}"
         $SUDO systemctl enable docker
         $SUDO systemctl start docker
     fi
 
-    # Thêm user hiện tại vào nhóm docker (để chạy không cần gõ sudo)
-    CURRENT_USER="${SUDO_USER:-$USER}"
-    if [ -n "$CURRENT_USER" ] && [ "$CURRENT_USER" != "root" ]; then
-        echo -e "\n${BLUE}ℹ Đang thêm người dùng ${BOLD}${CURRENT_USER}${NC}${BLUE} vào nhóm 'docker'...${NC}"
-        $SUDO usermod -aG docker "$CURRENT_USER" || true
-        echo -e "${YELLOW}ℹ Lưu ý: Để chạy lệnh 'docker' không cần 'sudo', bạn hãy đăng xuất và đăng nhập lại hoặc chạy:${NC}"
-        echo -e "   👉 ${CYAN}newgrp docker${NC}"
-    fi
+    # Cấp quyền cho user & socket
+    fix_linux_permissions
 
     # Cài đặt docker-compose nếu chưa có
     if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
@@ -199,13 +261,11 @@ esac
 # KIỂM TRA KẾT QUẢ
 # ==============================================================================
 echo -e "\n${CYAN}-----------------------------------------------------------------${NC}"
-echo -e "${GREEN}${BOLD}🎉 QUÁ TRÌNH CÀI ĐẶT HOÀN TẤT!${NC}"
+echo -e "${GREEN}${BOLD}🎉 QUÁ TRÌNH CÀI ĐẶT & CẤU HÌNH HOÀN TẤT!${NC}"
 echo -e "${CYAN}-----------------------------------------------------------------${NC}"
 
 if command -v docker >/dev/null 2>&1; then
     echo -e "${GREEN}✓ Docker Version:${NC} $(docker --version)"
-else
-    echo -e "${YELLOW}ℹ Nếu là Docker Desktop trên Mac, hãy mở ứng dụng để CLI được liên kết.${NC}"
 fi
 
 if docker compose version >/dev/null 2>&1; then
