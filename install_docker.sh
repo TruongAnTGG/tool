@@ -215,6 +215,56 @@ install_linux() {
         fi
     fi
 
+    # Tự động phát hiện và xử lý lỗi Proxmox VE Enterprise Repo (401 Unauthorized)
+    if [ -d /etc/pve ] || command -v pveversion >/dev/null 2>&1 || grep -rq "enterprise.proxmox.com" /etc/apt/ 2>/dev/null; then
+        if grep -rq "^[[:space:]]*deb[[:space:]]\+https\?:\/\/enterprise\.proxmox\.com" /etc/apt/ 2>/dev/null || grep -rq "enterprise\.proxmox\.com" /etc/apt/sources.list.d/*.sources 2>/dev/null; then
+            echo -e "\n${YELLOW}⚠ Phát hiện Proxmox VE đang dùng kho Enterprise (cần license trả phí)!${NC}"
+            echo -e "${YELLOW}ℹ Điều này sẽ gây lỗi '401 Unauthorized' khi apt-get update.${NC}"
+            echo -e "${BLUE}ℹ Đang tự động vô hiệu hoá kho Enterprise và thêm kho No-Subscription miễn phí...${NC}"
+            
+            # Vô hiệu hoá repo enterprise trong .list
+            $SUDO sed -i 's/^[[:space:]]*deb[[:space:]]\+\(https\?:\/\/enterprise\.proxmox\.com\)/# deb \1/g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            
+            # Vô hiệu hoá trong file .sources nếu có
+            for src in /etc/apt/sources.list.d/*.sources; do
+                if [ -f "$src" ] && grep -q "enterprise.proxmox.com" "$src" 2>/dev/null; then
+                    $SUDO sed -i 's/Enabled:[[:space:]]*yes/Enabled: no/g' "$src" 2>/dev/null || true
+                fi
+            done
+
+            # Lấy codename của Debian (bookworm, bullseye, trixie,...)
+            CODENAME=""
+            if [ -f /etc/os-release ]; then
+                CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+            fi
+            [ -z "$CODENAME" ] && CODENAME="bookworm"
+
+            # Thêm pve no-subscription nếu chưa có
+            if ! grep -rq "pve-no-subscription" /etc/apt/ 2>/dev/null; then
+                echo "deb http://download.proxmox.com/debian/pve ${CODENAME} pve-no-subscription" | $SUDO tee /etc/apt/sources.list.d/pve-no-subscription.list >/dev/null
+                echo -e "${GREEN}✓ Đã cấu hình kho Proxmox No-Subscription (${CODENAME})${NC}"
+            fi
+
+            # Xử lý kho ceph no-subscription nếu có cài ceph
+            if grep -rq "ceph" /etc/apt/sources.list.d/ 2>/dev/null; then
+                CEPH_VER="squid"
+                if grep -rq "ceph-reef" /etc/apt/ 2>/dev/null; then
+                    CEPH_VER="reef"
+                elif grep -rq "ceph-quincy" /etc/apt/ 2>/dev/null; then
+                    CEPH_VER="quincy"
+                fi
+                if ! grep -rq "ceph-.*no-subscription" /etc/apt/ 2>/dev/null; then
+                    echo "deb http://download.proxmox.com/debian/ceph-${CEPH_VER} ${CODENAME} no-subscription" | $SUDO tee /etc/apt/sources.list.d/ceph-no-subscription.list >/dev/null
+                    echo -e "${GREEN}✓ Đã cấu hình kho Ceph (${CEPH_VER}) No-Subscription${NC}"
+                fi
+            fi
+
+            echo -e "${BLUE}ℹ Đang làm mới danh mục gói phần mềm (apt-get update)...${NC}"
+            $SUDO apt-get update -qq || true
+            echo -e "${GREEN}✓ Đã khắc phục xong kho lưu trữ Proxmox!${NC}\n"
+        fi
+    fi
+
     echo -e "${BLUE}ℹ Đang tải và chạy script cài đặt chính thức từ Docker (https://get.docker.com)...${NC}"
     curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
     $SUDO sh /tmp/get-docker.sh
