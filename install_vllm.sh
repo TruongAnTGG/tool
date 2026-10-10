@@ -25,7 +25,7 @@ CONFIG_FILE="/etc/vllm/vllm.conf"
 DOCKER_CONTAINER_NAME="vllm-server"
 SYSTEMD_SERVICE_NAME="vllm"
 VLLM_VENV_DIR="/opt/vllm-env"
-DEFAULT_MODEL="Qwen/Qwen2.5-7B-Instruct"
+DEFAULT_MODEL="Qwen/Qwen2.5-7B-Instruct-AWQ"
 
 # Hiển thị banner
 show_banner() {
@@ -179,6 +179,9 @@ check_gpu() {
     echo -e "${BLUE}ℹ Đang kiểm tra thông tin GPU NVIDIA trên máy chủ...${NC}"
     detect_nvidia_hardware
 
+    GPU_VRAM_MB=0
+    GPU_VRAM_GB=0
+
     if command -v nvidia-smi >/dev/null 2>&1; then
         GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null || echo "")
         if [ -n "$GPU_INFO" ]; then
@@ -188,6 +191,13 @@ check_gpu() {
             done <<< "$GPU_INFO"
             HAS_NVIDIA_DRIVER=true
             HAS_NVIDIA_GPU=true
+
+            # Lấy dung lượng VRAM thực tế (MiB)
+            GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ' || echo "0")
+            if [ -n "$GPU_VRAM_MB" ] && [ "$GPU_VRAM_MB" -gt 0 ] 2>/dev/null; then
+                GPU_VRAM_GB=$(( (GPU_VRAM_MB + 512) / 1024 ))
+                echo -e "   ${CYAN}ℹ Dung lượng VRAM phát hiện:${NC} ${BOLD}~${GPU_VRAM_GB} GiB (${GPU_VRAM_MB} MiB)${NC}"
+            fi
         else
             echo -e "${RED}✗ Lệnh nvidia-smi có tồn tại nhưng không giao tiếp được với Driver!${NC}"
             HAS_NVIDIA_DRIVER=false
@@ -273,6 +283,7 @@ load_config() {
     MODE="${MODE:-docker}"
     GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
+    ENFORCE_EAGER="${ENFORCE_EAGER:-false}"
     API_KEY="${API_KEY:-}"
     HF_TOKEN="${HF_TOKEN:-}"
     SERVE_EXTRA_ARGS="${SERVE_EXTRA_ARGS:-}"
@@ -288,6 +299,7 @@ PORT="${PORT}"
 MODEL="${MODEL}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN}"
+ENFORCE_EAGER="${ENFORCE_EAGER}"
 API_KEY="${API_KEY}"
 HF_TOKEN="${HF_TOKEN}"
 SERVE_EXTRA_ARGS="${SERVE_EXTRA_ARGS}"
@@ -303,32 +315,44 @@ collect_user_config() {
     read -rp "$(echo -e "${BOLD}1. Cổng lắng nghe (Port)${NC} [Mặc định: ${GREEN}${DEFAULT_PORT}${NC}]: ")" INPUT_PORT
     PORT="${INPUT_PORT:-$DEFAULT_PORT}"
 
+    # Cảnh báo bộ nhớ VRAM tự động
+    if [ "$GPU_VRAM_MB" -gt 0 ] 2>/dev/null && [ "$GPU_VRAM_MB" -lt 15500 ] 2>/dev/null; then
+        echo -e "\n${YELLOW}${BOLD}⚠ PHÂN TÍCH VRAM GPU (${GPU_VRAM_MB} MiB ~ ${GPU_VRAM_GB} GiB):${NC}"
+        echo -e "${YELLOW}   Model 7B gốc dạng ${BOLD}bfloat16${NC} chiếm ~15 GiB VRAM -> ${RED}${BOLD}Chắc chắn bị CUDA Out of Memory!${NC}"
+        echo -e "   👉 ${GREEN}${BOLD}Giải pháp tối ưu tuyệt đối:${NC} Sử dụng bản nén ${BOLD}AWQ 4-bit${NC} (${CYAN}Qwen2.5-7B-Instruct-AWQ${NC})"
+        echo -e "      chỉ tốn ${GREEN}~5 GiB VRAM${NC}, giữ nguyên 99% trí thông minh và chạy mượt mà trên GPU ${GPU_VRAM_GB}GB."
+    fi
+
     # Lựa chọn Model
     echo -e "\n${BOLD}2. Chọn Mô hình AI (Model):${NC}"
-    echo -e "   1) ${CYAN}Qwen/Qwen2.5-7B-Instruct${NC}       (Khuyên dùng: Đỉnh cao Tiếng Việt + Tiếng Anh, cần ~16GB VRAM)"
-    echo -e "   2) ${CYAN}Qwen/Qwen2.5-1.5B-Instruct${NC}    (Siêu nhẹ, phù hợp GPU nhỏ ~4GB-6GB hoặc thử nghiệm)"
-    echo -e "   3) ${CYAN}Qwen/Qwen2.5-Coder-7B-Instruct${NC} (Chuyên lập trình code & fix lỗi)"
-    echo -e "   4) ${CYAN}meta-llama/Meta-Llama-3.1-8B-Instruct${NC} (Llama 3.1, cần HuggingFace Token)"
-    echo -e "   5) ${CYAN}mistralai/Mistral-7B-Instruct-v0.3${NC}"
-    echo -e "   6) ${CYAN}Nhập tên Model HuggingFace khác hoặc đường dẫn ổ đĩa cục bộ${NC}"
-    read -rp "Lựa chọn model [1-6] (Mặc định: 1): " MODEL_CHOICE
+    echo -e "   1) ${GREEN}${BOLD}Qwen/Qwen2.5-7B-Instruct-AWQ${NC}       (Khuyên dùng: Chuẩn AWQ 4-bit, chỉ tốn ~5GB VRAM, chống OOM 100%)"
+    echo -e "   2) ${CYAN}Qwen/Qwen2.5-Coder-7B-Instruct-AWQ${NC} (Chuyên lập trình code, tối ưu cho GPU 8GB-12GB)"
+    echo -e "   3) ${CYAN}Qwen/Qwen2.5-3B-Instruct${NC}           (Model 3B cân bằng, tốn ~6GB VRAM)"
+    echo -e "   4) ${CYAN}Qwen/Qwen2.5-1.5B-Instruct${NC}         (Siêu nhẹ, tốn ~3GB VRAM, chạy được trên mọi GPU/CPU)"
+    echo -e "   5) ${YELLOW}Qwen/Qwen2.5-7B-Instruct${NC}          (Bản gốc bfloat16 không nén - Yêu cầu GPU >= 16GB VRAM)"
+    echo -e "   6) ${CYAN}meta-llama/Meta-Llama-3.1-8B-Instruct-AWQ${NC} (Llama 3.1 8B AWQ, cần HF_TOKEN)"
+    echo -e "   7) ${CYAN}mistralai/Mistral-7B-Instruct-v0.3${NC}"
+    echo -e "   8) ${CYAN}Nhập tên Model HuggingFace khác hoặc đường dẫn ổ đĩa cục bộ${NC}"
+    read -rp "Lựa chọn model [1-8] (Mặc định: 1): " MODEL_CHOICE
     MODEL_CHOICE="${MODEL_CHOICE:-1}"
 
     case "$MODEL_CHOICE" in
-        1) MODEL="Qwen/Qwen2.5-7B-Instruct" ;;
-        2) MODEL="Qwen/Qwen2.5-1.5B-Instruct" ;;
-        3) MODEL="Qwen/Qwen2.5-Coder-7B-Instruct" ;;
-        4) MODEL="meta-llama/Meta-Llama-3.1-8B-Instruct" ;;
-        5) MODEL="mistralai/Mistral-7B-Instruct-v0.3" ;;
-        6)
-            read -rp "Nhập tên Model (VD: Qwen/Qwen2.5-14B-Instruct hoặc /models/my-model): " CUSTOM_MODEL
+        1) MODEL="Qwen/Qwen2.5-7B-Instruct-AWQ" ;;
+        2) MODEL="Qwen/Qwen2.5-Coder-7B-Instruct-AWQ" ;;
+        3) MODEL="Qwen/Qwen2.5-3B-Instruct" ;;
+        4) MODEL="Qwen/Qwen2.5-1.5B-Instruct" ;;
+        5) MODEL="Qwen/Qwen2.5-7B-Instruct" ;;
+        6) MODEL="meta-llama/Meta-Llama-3.1-8B-Instruct-AWQ" ;;
+        7) MODEL="mistralai/Mistral-7B-Instruct-v0.3" ;;
+        8)
+            read -rp "Nhập tên Model (VD: Qwen/Qwen2.5-7B-Instruct-AWQ hoặc /models/my-model): " CUSTOM_MODEL
             if [ -z "$CUSTOM_MODEL" ]; then
-                MODEL="Qwen/Qwen2.5-7B-Instruct"
+                MODEL="Qwen/Qwen2.5-7B-Instruct-AWQ"
             else
                 MODEL="$CUSTOM_MODEL"
             fi
             ;;
-        *) MODEL="Qwen/Qwen2.5-7B-Instruct" ;;
+        *) MODEL="Qwen/Qwen2.5-7B-Instruct-AWQ" ;;
     esac
 
     # Cấu hình API Key bảo mật
@@ -350,12 +374,29 @@ collect_user_config() {
     read -rp "GPU Memory Utilization [0.5 - 0.95] (Mặc định: 0.9): " INPUT_UTIL
     GPU_MEM_UTIL="${INPUT_UTIL:-0.9}"
 
-    # Giới hạn context length nếu máy yếu
+    # Giới hạn context length để chống OOM KV Cache
+    local DEFAULT_MAX_LEN="4096"
+    if [ "$GPU_VRAM_MB" -ge 16000 ] 2>/dev/null; then
+        DEFAULT_MAX_LEN="8192"
+    fi
+
     echo -e "\n${BOLD}6. Giới hạn độ dài ngữ cảnh (Max Model Length):${NC}"
-    echo -e "   Nhấn Enter để dùng mặc định của model (khuyên dùng)."
-    echo -e "   Nếu bị lỗi thiếu VRAM (CUDA Out of Memory), bạn có thể nhập: 4096 hoặc 8192."
-    read -rp "Max Model Len (Để trống = Mặc định): " INPUT_MAX_LEN
-    MAX_MODEL_LEN="$INPUT_MAX_LEN"
+    echo -e "   Mặc định gốc của model thường là 32,768 tokens (chiếm hàng GB VRAM cho KV Cache dễ gây crash OOM)."
+    echo -e "   Khuyên dùng: 4096 hoặc 8192 là cực kỳ thoải mái cho Chat, Agent, Lập trình."
+    read -rp "Max Model Len [Mặc định: ${DEFAULT_MAX_LEN}]: " INPUT_MAX_LEN
+    MAX_MODEL_LEN="${INPUT_MAX_LEN:-$DEFAULT_MAX_LEN}"
+
+    # Tùy chọn Enforce Eager mode cho GPU <= 16GB
+    ENFORCE_EAGER=false
+    if [ "$GPU_VRAM_MB" -gt 0 ] 2>/dev/null && [ "$GPU_VRAM_MB" -lt 15500 ] 2>/dev/null; then
+        echo -e "\n${BOLD}7. Chế độ Enforce Eager (Tiết kiệm bộ nhớ CUDA Graph):${NC}"
+        echo -e "   Bật chế độ này sẽ tắt pre-allocation của CUDA Graph, tiết kiệm thêm ~1.0 GiB VRAM."
+        read -rp "Bật Enforce Eager? [Y/n] (Mặc định: Y): " INPUT_EAGER
+        INPUT_EAGER="${INPUT_EAGER:-Y}"
+        if [[ "$INPUT_EAGER" =~ ^[Yy]$ ]]; then
+            ENFORCE_EAGER=true
+        fi
+    fi
 }
 
 # Cài đặt NVIDIA Container Toolkit (Cho Docker)
@@ -499,6 +540,7 @@ deploy_with_docker() {
         --name "$DOCKER_CONTAINER_NAME"
         --restart unless-stopped
         --ipc=host
+        -e "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
         -p "0.0.0.0:${PORT}:8000"
         -v "${CACHE_DIR}:/root/.cache/huggingface"
     )
@@ -516,9 +558,9 @@ deploy_with_docker() {
     echo -e "${BLUE}ℹ Image sử dụng:${NC} ${BOLD}${VLLM_IMAGE}${NC}"
     echo -e "${BLUE}ℹ Đang kéo image Docker và khởi chạy server (quá trình có thể mất vài phút)...${NC}"
 
-    # Tham số phục vụ vllm serve
+    # Tham số phục vụ vllm serve (truyền Model dạng positional argument theo chuẩn vLLM mới)
     local SERVE_ARGS=(
-        "--model" "$MODEL"
+        "$MODEL"
         "--host" "0.0.0.0"
         "--port" "8000"
         "--gpu-memory-utilization" "$GPU_MEM_UTIL"
@@ -526,6 +568,10 @@ deploy_with_docker() {
 
     if [ -n "$MAX_MODEL_LEN" ]; then
         SERVE_ARGS+=("--max-model-len" "$MAX_MODEL_LEN")
+    fi
+
+    if [ "$ENFORCE_EAGER" = true ]; then
+        SERVE_ARGS+=("--enforce-eager")
     fi
 
     if [ -n "$API_KEY" ]; then
@@ -576,6 +622,9 @@ deploy_with_python_systemd() {
     if [ -n "$MAX_MODEL_LEN" ]; then
         EXEC_CMD="$EXEC_CMD --max-model-len $MAX_MODEL_LEN"
     fi
+    if [ "$ENFORCE_EAGER" = true ]; then
+        EXEC_CMD="$EXEC_CMD --enforce-eager"
+    fi
     if [ -n "$API_KEY" ]; then
         EXEC_CMD="$EXEC_CMD --api-key $API_KEY"
     fi
@@ -593,6 +642,7 @@ Type=simple
 User=root
 WorkingDirectory=/root
 Environment=PYTHONUNBUFFERED=1
+Environment="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 Environment="HF_TOKEN=${HF_TOKEN}"
 ExecStart=${EXEC_CMD}
 Restart=always
