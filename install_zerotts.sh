@@ -3,7 +3,9 @@
 # ==============================================================================
 # Script Tự Động Cài Đặt, Cấu Hình & Quản Lý ZeroTTS Server (zeroweight-ai/ZeroTTS)
 # Mô hình chuyển văn bản thành giọng nói (TTS) Tiếng Việt siêu nhanh & tự nhiên
-# Hỗ trợ tăng tốc phần cứng bằng NVIDIA GPU (CUDA via ONNX Runtime GPU) hoặc CPU
+# Hỗ trợ 2 phương thức:
+#   1. DOCKER CONTAINER (Khuyên dùng: Cách ly môi trường, CUDA GPU, không lỗi thư viện)
+#   2. PYTHON VENV + SYSTEMD SERVICE
 # Tích hợp OpenAI-Compatible API (/v1/audio/speech) & Giao diện WebUI test giọng
 # Hỗ trợ: Ubuntu, Debian, CentOS, RHEL, AlmaLinux, RockyLinux
 # ==============================================================================
@@ -25,6 +27,8 @@ INSTALL_DIR="/opt/zerotts"
 VENV_DIR="$INSTALL_DIR/venv"
 CONFIG_FILE="/etc/zerotts/zerotts.conf"
 SYSTEMD_SERVICE="zerotts"
+DOCKER_CONTAINER_NAME="zerotts-server"
+DOCKER_IMAGE_NAME="zerotts-server:latest"
 DEFAULT_PORT="8002"
 MODEL_REPO="zeroweight-ai/ZeroTTS"
 
@@ -40,7 +44,7 @@ show_banner() {
 # Kiểm tra quyền root
 check_root() {
     if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}✗ Lỗi: Script yêu cầu quyền root để cài đặt gói và mở Firewall.${NC}"
+        echo -e "${RED}✗ Lỗi: Script yêu cầu quyền root để cài đặt Docker/gói và mở Firewall.${NC}"
         echo -e "${YELLOW}ℹ Vui lòng chạy lại bằng lệnh:${NC} ${BOLD}sudo bash $0${NC}\n"
         exit 1
     fi
@@ -169,12 +173,14 @@ load_config() {
     fi
     PORT="${PORT:-$DEFAULT_PORT}"
     DEVICE="${DEVICE:-cuda}"
+    MODE="${MODE:-docker}"
 }
 
 # Lưu cấu hình ra file
 save_config() {
     mkdir -p "$(dirname "$CONFIG_FILE")"
     cat > "$CONFIG_FILE" <<EOF
+MODE="${MODE}"
 PORT="${PORT}"
 DEVICE="${DEVICE}"
 MODEL_REPO="${MODEL_REPO}"
@@ -182,18 +188,49 @@ EOF
     chmod 600 "$CONFIG_FILE"
 }
 
-# Cài đặt các gói hệ thống cần thiết
-install_system_packages() {
-    echo -e "${BLUE}ℹ Đang cài đặt các phụ thuộc hệ thống (Python3, pip, venv, audio tools)...${NC}"
-    if [ "$PKG_MANAGER" = "apt-get" ]; then
-        apt-get update -qq
-        apt-get install -y -qq python3 python3-pip python3-venv python3-dev build-essential \
-            libsndfile1 ffmpeg git curl ca-certificates
-    elif [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ]; then
-        $PKG_MANAGER install -y -q python3 python3-pip python3-devel gcc gcc-c++ make \
-            libsndfile ffmpeg git curl ca-certificates
+# Cài đặt NVIDIA Container Toolkit (nếu dùng Docker + GPU)
+install_nvidia_container_toolkit() {
+    echo -e "\n${BLUE}ℹ Kiểm tra NVIDIA Container Toolkit (nvidia-docker / nvidia-ctk)...${NC}"
+    if command -v nvidia-ctk >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ NVIDIA Container Toolkit đã được cài đặt.${NC}"
+    else
+        echo -e "${YELLOW}ℹ Đang cài đặt nvidia-container-toolkit để Docker truy cập GPU...${NC}"
+        if [ "$PKG_MANAGER" = "apt-get" ]; then
+            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg --yes 2>/dev/null || true
+            curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+                sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+                tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+            apt-get update -qq
+            apt-get install -y -qq nvidia-container-toolkit
+        elif [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ]; then
+            curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+                tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
+            $PKG_MANAGER install -y -q nvidia-container-toolkit
+        fi
     fi
-    echo -e "${GREEN}✓ Đã cài đặt xong gói hệ thống.${NC}"
+
+    if command -v nvidia-ctk >/dev/null 2>&1; then
+        nvidia-ctk runtime configure --runtime=docker >/dev/null 2>&1 || true
+        systemctl restart docker >/dev/null 2>&1 || true
+        echo -e "${GREEN}✓ Cấu hình NVIDIA runtime cho Docker thành công!${NC}"
+    fi
+}
+
+# Cài đặt Docker tự động nếu chưa có
+ensure_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${YELLOW}ℹ Chưa tìm thấy Docker, đang cài đặt Docker Engine chính thức...${NC}"
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        sh /tmp/get-docker.sh
+        rm -f /tmp/get-docker.sh
+        systemctl enable --now docker
+        echo -e "${GREEN}✓ Cài đặt Docker Engine thành công!${NC}"
+    fi
+    systemctl start docker 2>/dev/null || true
+
+    if [ "$HAS_NVIDIA_GPU" = true ]; then
+        install_nvidia_container_toolkit
+    fi
 }
 
 # Tạo mã nguồn máy chủ FastAPI & Web UI (server.py)
@@ -206,7 +243,7 @@ import time
 import soundfile as sf
 import numpy as np
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -222,14 +259,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Khởi tạo mô hình ZeroTTS
 MODEL_ID = os.getenv("MODEL_REPO", "zeroweight-ai/ZeroTTS")
 DEVICE = os.getenv("DEVICE", "cuda")
 
-print(f"[*] Đang tải ZeroTTS model '{MODEL_ID}' (Device: {DEVICE})...")
+print(f"[*] Đang tải ZeroTTS model '{MODEL_ID}' (Target Device: {DEVICE})...")
 try:
     tts = ZeroTTS.from_pretrained(MODEL_ID)
-    print("[+] Tải ZeroTTS model thành công!")
+    print(f"[+] Tải ZeroTTS model thành công! Sample rate: {tts.sample_rate}Hz")
 except Exception as e:
     print(f"[!] Lỗi khi nạp model: {e}")
     raise e
@@ -252,9 +288,7 @@ def health():
 
 @app.get("/v1/audio/voices")
 def get_voices():
-    # Danh sách các giọng nói được hỗ trợ
-    available_voices = ["maichi"]
-    return {"voices": available_voices, "default": "maichi"}
+    return {"voices": ["maichi"], "default": "maichi"}
 
 @app.post("/v1/audio/speech")
 def text_to_speech(req: SpeechRequest):
@@ -266,7 +300,6 @@ def text_to_speech(req: SpeechRequest):
     
     try:
         audio = tts.synthesize(req.input, voice=voice_name)
-        # Chuyển đổi audio sang buffer WAV
         wav_io = io.BytesIO()
         sf.write(wav_io, audio, tts.sample_rate, format='WAV')
         wav_io.seek(0)
@@ -293,7 +326,7 @@ def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>ZeroTTS Vietnamese Studio</title>
+        <title>ZeroTTS Studio - Vietnamese Speech AI</title>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet">
         <style>
             :root {
@@ -359,9 +392,7 @@ def index():
                 outline: none;
                 transition: border-color 0.2s;
             }
-            textarea:focus {
-                border-color: var(--primary);
-            }
+            textarea:focus { border-color: var(--primary); }
             .grid {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
@@ -401,10 +432,7 @@ def index():
                 border: 1px solid var(--border);
                 display: none;
             }
-            audio {
-                width: 100%;
-                margin-top: 8px;
-            }
+            audio { width: 100%; margin-top: 8px; }
             .stats {
                 font-size: 12px;
                 color: var(--muted);
@@ -426,7 +454,7 @@ def index():
             <p class="desc">Chuyển văn bản thành giọng nói Tiếng Việt siêu nhanh (~70ms) và tự nhiên với ZeroTTS.</p>
             
             <label for="text">Nhập văn bản Tiếng Việt:</label>
-            <textarea id="text" placeholder="Nhập câu tiếng Việt bất kỳ, ví dụ: Xin chào các bạn! Hôm nay ngày 31/12/2025, ZeroTTS hoạt động cực kỳ mượt mà.">Xin chào các bạn! Mình là mô hình giọng nói nhân tạo ZeroTTS, hỗ trợ Tiếng Việt tự nhiên và siêu nhanh.</textarea>
+            <textarea id="text" placeholder="Nhập câu tiếng Việt bất kỳ...">Xin chào các bạn! Mình là mô hình giọng nói nhân tạo ZeroTTS, hỗ trợ Tiếng Việt tự nhiên và siêu nhanh.</textarea>
             
             <div class="grid">
                 <div>
@@ -436,7 +464,7 @@ def index():
                     </select>
                 </div>
                 <div>
-                    <label>Chuẩn tương thích:</label>
+                    <label>Chuẩn kết nối:</label>
                     <select disabled>
                         <option>OpenAI Audio Speech API</option>
                     </select>
@@ -505,48 +533,157 @@ EOF
     chmod 644 "$INSTALL_DIR/server.py"
 }
 
-# Cài đặt môi trường Python & các gói TTS (kèm ONNX Runtime GPU / CUDA)
-setup_python_environment() {
-    install_system_packages
+# Tạo Dockerfile chuyên biệt cho ZeroTTS
+create_dockerfile() {
+    mkdir -p "$INSTALL_DIR"
+    cat > "$INSTALL_DIR/Dockerfile" <<'EOF'
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    libsndfile1 \
+    ffmpeg \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip3 install --no-cache-dir \
+    zerotts \
+    onnxruntime-gpu \
+    fastapi \
+    uvicorn \
+    soundfile \
+    scipy \
+    numpy \
+    huggingface-hub \
+    pydantic
+
+COPY server.py /app/server.py
+
+EXPOSE 8002
+
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8002"]
+EOF
+    chmod 644 "$INSTALL_DIR/Dockerfile"
+}
+
+# ==============================================================================
+# PHƯƠNG THỨC 1: CÀI ĐẶT & CHẠY BẰNG DOCKER (KHUYÊN DÙNG)
+# ==============================================================================
+deploy_with_docker() {
+    ensure_docker
+    check_gpu
+    load_config
+
+    echo -e "\n${CYAN}${BOLD}--- CẤU HÌNH ZEROTTS DOCKER CONTAINER ---${NC}\n"
+    read -rp "$(echo -e "${BOLD}Cổng lắng nghe (Port)${NC} [Mặc định: ${GREEN}${DEFAULT_PORT}${NC}]: ")" INPUT_PORT
+    PORT="${INPUT_PORT:-$DEFAULT_PORT}"
+
+    MODE="docker"
+    save_config
+    open_firewall_port "$PORT"
+
+    create_server_script
+    create_dockerfile
+
+    echo -e "\n${BLUE}ℹ Đang build Docker Image '${DOCKER_IMAGE_NAME}' (quá trình mất 2-3 phút)...${NC}"
+    cd "$INSTALL_DIR"
+    docker build -t "$DOCKER_IMAGE_NAME" .
+
+    # Dừng container cũ nếu đang chạy
+    if docker ps -a --format '{{.Names}}' | grep -Eq "^${DOCKER_CONTAINER_NAME}\$"; then
+        echo -e "${YELLOW}ℹ Dừng và xóa container '${DOCKER_CONTAINER_NAME}' cũ...${NC}"
+        docker stop "$DOCKER_CONTAINER_NAME" >/dev/null 2>&1 || true
+        docker rm "$DOCKER_CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+
+    # Thư mục cache model trên host để không phải tải lại model khi restart
+    CACHE_DIR="/root/.cache/huggingface"
+    mkdir -p "$CACHE_DIR"
+
+    # Lệnh chạy docker
+    local DOCKER_RUN_CMD=(
+        docker run -d
+        --name "$DOCKER_CONTAINER_NAME"
+        --restart unless-stopped
+        --ipc=host
+        -p "0.0.0.0:${PORT}:8002"
+        -v "${CACHE_DIR}:/root/.cache/huggingface"
+        -e "MODEL_REPO=${MODEL_REPO}"
+    )
+
+    if [ "$HAS_NVIDIA_GPU" = true ]; then
+        DOCKER_RUN_CMD+=(--gpus all -e "DEVICE=cuda")
+        echo -e "${GREEN}✓ Kích hoạt tăng tốc NVIDIA GPU (--gpus all).${NC}"
+    else
+        DOCKER_RUN_CMD+=(-e "DEVICE=cpu")
+        echo -e "${YELLOW}ℹ Khởi chạy chế độ CPU.${NC}"
+    fi
+
+    echo -e "\n${BLUE}ℹ Đang khởi chạy Docker container...${NC}"
+    "${DOCKER_RUN_CMD[@]}" "$DOCKER_IMAGE_NAME"
+
+    echo -e "\n${GREEN}${BOLD}✓ Khởi tạo ZeroTTS Container thành công!${NC}"
+    post_install_guide
+}
+
+# ==============================================================================
+# PHƯƠNG THỨC 2: CÀI ĐẶT BẰNG PYTHON VENV + SYSTEMD
+# ==============================================================================
+deploy_with_python_systemd() {
+    detect_os
+    check_gpu
+    load_config
+
+    echo -e "\n${CYAN}${BOLD}--- CẤU HÌNH ZEROTTS SYSTEMD SERVICE ---${NC}\n"
+    read -rp "$(echo -e "${BOLD}Cổng lắng nghe (Port)${NC} [Mặc định: ${GREEN}${DEFAULT_PORT}${NC}]: ")" INPUT_PORT
+    PORT="${INPUT_PORT:-$DEFAULT_PORT}"
+
+    MODE="systemd"
+    save_config
+    open_firewall_port "$PORT"
+
+    # Cài đặt gói hệ thống
+    echo -e "${BLUE}ℹ Đang cài đặt các phụ thuộc hệ thống...${NC}"
+    if [ "$PKG_MANAGER" = "apt-get" ]; then
+        apt-get update -qq
+        apt-get install -y -qq python3 python3-pip python3-venv python3-dev build-essential libsndfile1 ffmpeg git curl
+    elif [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ]; then
+        $PKG_MANAGER install -y -q python3 python3-pip python3-devel gcc gcc-c++ make libsndfile ffmpeg git curl
+    fi
+
     create_server_script
 
-    echo -e "\n${BLUE}ℹ Đang thiết lập Python Virtual Environment tại ${BOLD}${VENV_DIR}${NC}...${NC}"
+    echo -e "\n${BLUE}ℹ Đang tạo Python Virtual Environment tại ${BOLD}${VENV_DIR}${NC}...${NC}"
     rm -rf "$VENV_DIR"
     python3 -m venv "$VENV_DIR"
     # shellcheck disable=SC1091
     source "$VENV_DIR/bin/activate"
 
-    echo -e "${BLUE}ℹ Đang nâng cấp pip và cài đặt thư viện ZeroTTS...${NC}"
+    echo -e "${BLUE}ℹ Đang nâng cấp pip và cài đặt gói ZeroTTS...${NC}"
     pip install --upgrade pip setuptools wheel
-
-    # Cài đặt các gói core
     pip install "zerotts" "fastapi" "uvicorn" "pydantic" "soundfile" "scipy" "numpy" "huggingface-hub"
 
-    # Kiểm tra và cài đặt tăng tốc GPU với onnxruntime-gpu
     if [ "$HAS_NVIDIA_GPU" = true ]; then
-        echo -e "${GREEN}ℹ Đang cài đặt 'onnxruntime-gpu' để tăng tốc bằng NVIDIA CUDA...${NC}"
         pip install "onnxruntime-gpu" || pip install "onnxruntime"
         DEVICE="cuda"
     else
-        echo -e "${YELLOW}ℹ Đang cài đặt 'onnxruntime' cho CPU inference...${NC}"
         pip install "onnxruntime"
         DEVICE="cpu"
     fi
 
-    # Tải trước model để kiểm tra tính toàn vẹn
-    echo -e "\n${BLUE}ℹ Đang tải trước (Pre-caching) weights của ZeroTTS từ HuggingFace...${NC}"
-    python3 -c "from zerotts import ZeroTTS; print('Đang kết nối tải model...'); tts = ZeroTTS.from_pretrained('$MODEL_REPO'); print('Tải model thành công!')" || true
-
-    echo -e "${GREEN}✓ Môi trường Python và ZeroTTS đã được cài đặt hoàn tất!${NC}"
-}
-
-# Cấu hình systemd service để tự khởi động cùng hệ thống
-setup_systemd_service() {
-    echo -e "\n${BLUE}ℹ Đang tạo dịch vụ Systemd (${SYSTEMD_SERVICE}.service)...${NC}"
-
+    # Tạo file systemd service
     cat > "/etc/systemd/system/${SYSTEMD_SERVICE}.service" <<EOF
 [Unit]
-Description=ZeroTTS Vietnamese High-Performance Speech API Server
+Description=ZeroTTS Vietnamese Speech API Server
 After=network.target
 
 [Service]
@@ -568,24 +705,8 @@ EOF
     systemctl daemon-reload
     systemctl enable "${SYSTEMD_SERVICE}"
     systemctl restart "${SYSTEMD_SERVICE}"
-    echo -e "${GREEN}✓ Đã khởi động dịch vụ ZeroTTS thành công qua Systemd!${NC}"
-}
 
-# Triển khai toàn diện ZeroTTS
-deploy_zerotts() {
-    detect_os
-    check_gpu
-    load_config
-
-    echo -e "\n${CYAN}${BOLD}--- CẤU HÌNH THÔNG SỐ ZEROTTS SERVER ---${NC}\n"
-    read -rp "$(echo -e "${BOLD}Cổng lắng nghe (Port)${NC} [Mặc định: ${GREEN}${DEFAULT_PORT}${NC}]: ")" INPUT_PORT
-    PORT="${INPUT_PORT:-$DEFAULT_PORT}"
-
-    save_config
-    open_firewall_port "$PORT"
-    setup_python_environment
-    setup_systemd_service
-
+    echo -e "\n${GREEN}${BOLD}✓ Khởi tạo Systemd service cho ZeroTTS thành công!${NC}"
     post_install_guide
 }
 
@@ -602,13 +723,20 @@ post_install_guide() {
     echo -e "   • Giao diện WebUI thử giọng:   ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}${NC}"
     echo -e "   • Base URL (Mạng ngoài):       ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}/v1${NC}"
     echo -e "   • Localhost:                  ${GREEN}http://127.0.0.1:${PORT}${NC}"
-    echo -e "   • Tăng tốc phần cứng:          ${CYAN}${BOLD}${DEVICE^^}${NC}"
+    echo -e "   • Chế độ chạy:                ${CYAN}${BOLD}${MODE^^}${NC} (Tăng tốc: ${DEVICE^^})"
 
     echo -e "\n${BOLD}📋 LỆNH QUẢN LÝ DỊCH VỤ:${NC}"
-    echo -e "   • Xem live logs:     ${BOLD}journalctl -u ${SYSTEMD_SERVICE} -f${NC}"
-    echo -e "   • Kiểm tra status:   ${BOLD}systemctl status ${SYSTEMD_SERVICE}${NC}"
-    echo -e "   • Khởi động lại:     ${BOLD}systemctl restart ${SYSTEMD_SERVICE}${NC}"
-    echo -e "   • Dừng dịch vụ:      ${BOLD}systemctl stop ${SYSTEMD_SERVICE}${NC}"
+    if [ "$MODE" = "docker" ]; then
+        echo -e "   • Xem live logs:     ${BOLD}docker logs -f ${DOCKER_CONTAINER_NAME}${NC}"
+        echo -e "   • Kiểm tra trạng thái: ${BOLD}docker ps -f name=${DOCKER_CONTAINER_NAME}${NC}"
+        echo -e "   • Khởi động lại:     ${BOLD}docker restart ${DOCKER_CONTAINER_NAME}${NC}"
+        echo -e "   • Dừng dịch vụ:      ${BOLD}docker stop ${DOCKER_CONTAINER_NAME}${NC}"
+    else
+        echo -e "   • Xem live logs:     ${BOLD}journalctl -u ${SYSTEMD_SERVICE} -f${NC}"
+        echo -e "   • Kiểm tra status:   ${BOLD}systemctl status ${SYSTEMD_SERVICE}${NC}"
+        echo -e "   • Khởi động lại:     ${BOLD}systemctl restart ${SYSTEMD_SERVICE}${NC}"
+        echo -e "   • Dừng dịch vụ:      ${BOLD}systemctl stop ${SYSTEMD_SERVICE}${NC}"
+    fi
 
     echo -e "\n${BOLD}💻 VÍ DỤ GỌI API CHUẨN OPENAI (TÍCH HỢP CHO HỆ THỐNG KHÁC):${NC}"
     echo -e "${YELLOW}1. Bằng cURL (Tải file âm thanh speech.wav):${NC}"
@@ -626,7 +754,7 @@ post_install_guide() {
     echo -e "response = client.audio.speech.create("
     echo -e "    model=\"zerotts\","
     echo -e "    voice=\"maichi\","
-    echo -e "    input=\"Xin chào bạn!\""
+    echo -e "    input=\"Hôm nay trời rất đẹp, chúc bạn một ngày làm việc hiệu quả!\""
     echo -e ")"
     echo -e "response.stream_to_file(\"output.wav\")${NC}"
 
@@ -641,10 +769,18 @@ check_status() {
     echo -e "\n${CYAN}${BOLD}=== KIỂM TRA TRẠNG THÁI ZEROTTS SERVER ===${NC}\n"
     check_gpu
 
-    if systemctl is-active --quiet "$SYSTEMD_SERVICE" 2>/dev/null; then
-        echo -e "\n${GREEN}✓ Dịch vụ ${SYSTEMD_SERVICE} đang CHẠY bình thường.${NC}"
+    if [ "$MODE" = "docker" ]; then
+        if docker ps --format '{{.Names}} (Status: {{.Status}})' | grep -Eq "^${DOCKER_CONTAINER_NAME}"; then
+            echo -e "\n${GREEN}✓ Docker Container '${DOCKER_CONTAINER_NAME}' đang CHẠY.${NC}"
+        else
+            echo -e "\n${RED}✗ Docker Container '${DOCKER_CONTAINER_NAME}' ĐANG DỪNG hoặc chưa tạo.${NC}"
+        fi
     else
-        echo -e "\n${RED}✗ Dịch vụ ${SYSTEMD_SERVICE} ĐANG DỪNG hoặc gặp lỗi.${NC}"
+        if systemctl is-active --quiet "$SYSTEMD_SERVICE" 2>/dev/null; then
+            echo -e "\n${GREEN}✓ Dịch vụ ${SYSTEMD_SERVICE} đang CHẠY bình thường.${NC}"
+        else
+            echo -e "\n${RED}✗ Dịch vụ ${SYSTEMD_SERVICE} ĐANG DỪNG hoặc gặp lỗi.${NC}"
+        fi
     fi
 
     # Kiểm tra cổng lắng nghe
@@ -669,14 +805,19 @@ check_status() {
     if [ -n "$RES" ]; then
         echo -e "${GREEN}✓ Phản hồi từ server:${NC} ${CYAN}${RES}${NC}"
     else
-        echo -e "${YELLOW}⚠ Server chưa phản hồi HTTP.${NC}"
+        echo -e "${YELLOW}⚠ Server chưa phản hồi HTTP (có thể đang download model).${NC}"
     fi
 }
 
 # Xem logs thời gian thực
 view_logs() {
+    load_config
     echo -e "\n${BLUE}ℹ Đang mở live log (Nhấn Ctrl+C để thoát)...${NC}\n"
-    journalctl -u "$SYSTEMD_SERVICE" -f
+    if [ "$MODE" = "docker" ]; then
+        docker logs -f "$DOCKER_CONTAINER_NAME"
+    else
+        journalctl -u "$SYSTEMD_SERVICE" -f
+    fi
 }
 
 # Test tạo âm thanh thử nghiệm qua CLI
@@ -706,20 +847,31 @@ test_synthesis() {
 
 # Khởi động lại
 restart_service() {
+    load_config
     echo -e "\n${BLUE}ℹ Đang khởi động lại dịch vụ ZeroTTS...${NC}"
-    systemctl restart "$SYSTEMD_SERVICE"
+    if [ "$MODE" = "docker" ]; then
+        docker restart "$DOCKER_CONTAINER_NAME"
+    else
+        systemctl restart "$SYSTEMD_SERVICE"
+    fi
     echo -e "${GREEN}✓ Đã gửi lệnh khởi động lại.${NC}"
 }
 
 # Dừng dịch vụ
 stop_service() {
+    load_config
     echo -e "\n${YELLOW}ℹ Đang dừng dịch vụ ZeroTTS...${NC}"
-    systemctl stop "$SYSTEMD_SERVICE" || true
+    if [ "$MODE" = "docker" ]; then
+        docker stop "$DOCKER_CONTAINER_NAME" || true
+    else
+        systemctl stop "$SYSTEMD_SERVICE" || true
+    fi
     echo -e "${GREEN}✓ Đã dừng dịch vụ.${NC}"
 }
 
 # Gỡ bỏ dịch vụ
 uninstall_zerotts() {
+    load_config
     echo -e "\n${RED}${BOLD}⚠ CẢNH BÁO: BẠN CÓ CHẮC CHẮN MUỐN GỠ BỎ ZEROTTS?${NC}"
     read -rp "Xác nhận gỡ bỏ? (gõ 'yes' để xác nhận): " CONFIRM
     if [ "$CONFIRM" != "yes" ]; then
@@ -727,11 +879,18 @@ uninstall_zerotts() {
         return 0
     fi
 
-    echo -e "\n${BLUE}ℹ Đang gỡ bỏ systemd service và dọn dẹp thư mục...${NC}"
-    systemctl stop "$SYSTEMD_SERVICE" 2>/dev/null || true
-    systemctl disable "$SYSTEMD_SERVICE" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SYSTEMD_SERVICE}.service"
-    systemctl daemon-reload
+    echo -e "\n${BLUE}ℹ Đang gỡ bỏ container và dịch vụ...${NC}"
+    if docker ps -a --format '{{.Names}}' | grep -Eq "^${DOCKER_CONTAINER_NAME}\$"; then
+        docker stop "$DOCKER_CONTAINER_NAME" >/dev/null 2>&1 || true
+        docker rm "$DOCKER_CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+
+    if [ -f "/etc/systemd/system/${SYSTEMD_SERVICE}.service" ]; then
+        systemctl stop "$SYSTEMD_SERVICE" 2>/dev/null || true
+        systemctl disable "$SYSTEMD_SERVICE" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${SYSTEMD_SERVICE}.service"
+        systemctl daemon-reload
+    fi
 
     rm -rf "$INSTALL_DIR"
     rm -rf "$CONFIG_FILE"
@@ -746,43 +905,47 @@ main_menu() {
     load_config
 
     echo -e "${BOLD}Chọn tác vụ bạn muốn thực hiện:${NC}"
-    echo -e "   1) ${GREEN}${BOLD}Cài đặt & Khởi chạy ZeroTTS Server (GPU/CPU + WebUI + OpenAI API)${NC}"
-    echo -e "   2) ${YELLOW}Kiểm tra trạng thái & GPU VRAM${NC}"
-    echo -e "   3) ${CYAN}Xem Live Logs của dịch vụ${NC}"
-    echo -e "   4) ${GREEN}Test tạo file âm thanh mẫu (WAV Test)${NC}"
-    echo -e "   5) ${BLUE}Mở / Kiểm tra lại tường lửa cho Port ${PORT}${NC}"
-    echo -e "   6) Khởi động lại dịch vụ"
-    echo -e "   7) Dừng dịch vụ"
-    echo -e "   8) ${RED}Gỡ bỏ ZeroTTS hoàn toàn${NC}"
+    echo -e "   1) ${GREEN}${BOLD}Cài đặt & Khởi chạy bằng DOCKER (Khuyên dùng - Ổn định, hỗ trợ CUDA GPU)${NC}"
+    echo -e "   2) ${CYAN}Cài đặt bằng Python Virtualenv + Systemd service${NC}"
+    echo -e "   3) ${YELLOW}Kiểm tra trạng thái & Cổng lắng nghe (${PORT})${NC}"
+    echo -e "   4) ${CYAN}Xem Live Logs của dịch vụ${NC}"
+    echo -e "   5) ${GREEN}Test tạo file âm thanh mẫu (WAV Test)${NC}"
+    echo -e "   6) ${BLUE}Mở / Kiểm tra lại tường lửa cho Port ${PORT}${NC}"
+    echo -e "   7) Khởi động lại dịch vụ"
+    echo -e "   8) Dừng dịch vụ"
+    echo -e "   9) ${RED}Gỡ bỏ ZeroTTS hoàn toàn${NC}"
     echo -e "   0) Thoát"
 
     echo ""
-    read -rp "Nhập lựa chọn của bạn [0-8] (Mặc định: 1): " MENU_CHOICE
+    read -rp "Nhập lựa chọn của bạn [0-9] (Mặc định: 1): " MENU_CHOICE
     MENU_CHOICE="${MENU_CHOICE:-1}"
 
     case "$MENU_CHOICE" in
         1)
-            deploy_zerotts
+            deploy_with_docker
             ;;
         2)
-            check_status
+            deploy_with_python_systemd
             ;;
         3)
-            view_logs
+            check_status
             ;;
         4)
-            test_synthesis
+            view_logs
             ;;
         5)
-            open_firewall_port "$PORT"
+            test_synthesis
             ;;
         6)
-            restart_service
+            open_firewall_port "$PORT"
             ;;
         7)
-            stop_service
+            restart_service
             ;;
         8)
+            stop_service
+            ;;
+        9)
             uninstall_zerotts
             ;;
         0)
