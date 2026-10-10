@@ -288,20 +288,40 @@ def health():
 
 @app.get("/v1/audio/voices")
 def get_voices():
-    return {"voices": ["maichi"], "default": "maichi"}
+    try:
+        voices = tts.list_voices()
+    except Exception:
+        voices = ["maichi"]
+    default_voice = voices[0] if voices else "maichi"
+    return {"voices": voices, "default": default_voice}
 
 @app.post("/v1/audio/speech")
 def text_to_speech(req: SpeechRequest):
     if not req.input or not req.input.strip():
         raise HTTPException(status_code=400, detail="Nội dung 'input' không được để trống.")
     
-    voice_name = req.voice or "maichi"
+    # Kiểm tra và resolve giọng đọc
+    try:
+        available_voices = tts.list_voices()
+    except Exception:
+        available_voices = ["maichi"]
+
+    voice_name = req.voice
+    if not voice_name or (voice_name not in available_voices and available_voices):
+        voice_name = available_voices[0] if available_voices else "maichi"
+
     start_time = time.time()
     
     try:
+        # Gọi ZeroTTS tổng hợp giọng nói (trả về numpy array shape 1, T)
         audio = tts.synthesize(req.input, voice=voice_name)
+
+        # Chuẩn hóa về 1D float32 trước khi ghi vào soundfile
+        audio_data = np.asarray(audio, dtype=np.float32).squeeze()
+
+        # Lưu vào buffer WAV chuẩn 16-bit PCM (chống lỗi kênh âm thanh soundfile)
         wav_io = io.BytesIO()
-        sf.write(wav_io, audio, tts.sample_rate, format='WAV')
+        sf.write(wav_io, audio_data, tts.sample_rate, format='WAV', subtype='PCM_16')
         wav_io.seek(0)
         
         proc_time = round((time.time() - start_time) * 1000, 2)
@@ -316,6 +336,9 @@ def text_to_speech(req: SpeechRequest):
             }
         )
     except Exception as e:
+        import traceback
+        print(f"[!] Lỗi phát sinh trong synthesize: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Lỗi tạo âm thanh: {str(e)}")
 
 @app.get("/", response_class=HTMLResponse)
@@ -481,6 +504,26 @@ def index():
         </div>
 
         <script>
+            window.addEventListener('DOMContentLoaded', async () => {
+                try {
+                    const res = await fetch('/v1/audio/voices');
+                    const data = await res.json();
+                    const sel = document.getElementById('voice');
+                    if (data.voices && data.voices.length > 0) {
+                        sel.innerHTML = '';
+                        data.voices.forEach(v => {
+                            const opt = document.createElement('option');
+                            opt.value = v;
+                            opt.textContent = v === 'maichi' ? 'Mai Chi (Nữ - Mặc định)' : v;
+                            sel.appendChild(opt);
+                        });
+                        if (data.default) sel.value = data.default;
+                    }
+                } catch (e) {
+                    console.warn('Lỗi lấy danh sách giọng:', e);
+                }
+            });
+
             async function generateSpeech() {
                 const text = document.getElementById('text').value;
                 const voice = document.getElementById('voice').value;
@@ -507,7 +550,7 @@ def index():
 
                     if (!response.ok) {
                         const err = await response.json();
-                        throw new Error(err.detail || 'Lỗi server');
+                        throw new Error(err.detail || 'Lỗi server (HTTP ' + response.status + ')');
                     }
 
                     const blob = await response.blob();
