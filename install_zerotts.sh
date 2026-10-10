@@ -240,16 +240,28 @@ create_server_script() {
 import os
 import io
 import time
-import soundfile as sf
+import shutil
+import base64
+import tempfile
+from typing import Optional, List, Dict, Any
 import numpy as np
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import HTMLResponse
+from scipy.io import wavfile
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form, Query
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-from zerotts import ZeroTTS
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="ZeroTTS Vietnamese API Server", version="1.0.0")
+from zerotts import ZeroTTS, normalize_vi_text
+from zerotts.chunking import chunk_text, clean_segment_punctuation, normalize_punctuation
+from zerotts.audio import concat_with_silence
+
+app = FastAPI(
+    title="ZeroTTS Vietnamese AI Speech API",
+    description="Hệ thống API chuyển văn bản thành giọng nói tiếng Việt thời gian thực (Tương thích 100% chuẩn OpenAI Audio Speech và REST API cho hệ thống ngoài tích hợp).",
+    version="1.2.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -262,10 +274,9 @@ app.add_middleware(
 MODEL_ID = os.getenv("MODEL_REPO", "zeroweight-ai/ZeroTTS")
 DEVICE = os.getenv("DEVICE", "cuda").lower()
 
-print(f"[*] Khởi tạo ZeroTTS model '{MODEL_ID}' (Target Device: {DEVICE})...")
+print(f"[*] Khởi tạo ZeroTTS model '{MODEL_ID}' (Cấu hình thiết bị: {DEVICE})...")
 
-# ZeroTTS mặc định chỉ dùng CPUExecutionProvider nếu không truyền providers cụ thể.
-# Vì vậy cần khai báo rõ CUDAExecutionProvider để kích hoạt GPU NVIDIA.
+# Khởi tạo Execution Providers cho ONNX Runtime
 providers = ["CPUExecutionProvider"]
 if DEVICE == "cuda":
     try:
@@ -294,14 +305,160 @@ except Exception as e:
     else:
         raise e
 
-class SpeechRequest(BaseModel):
-    model: Optional[str] = "zerotts"
-    input: str
-    voice: Optional[str] = "maichi"
-    response_format: Optional[str] = "wav"
-    speed: Optional[float] = 1.0
+# Bảng metadata chi tiết cho 8 giọng mặc định của ZeroTTS
+BUILTIN_VOICES_INFO = {
+    "maichi": {
+        "id": "maichi",
+        "name": "Mai Chi",
+        "gender": "nữ",
+        "tags": ["trẻ", "kể chuyện", "nhẹ nhàng", "thân thiện"],
+        "description": "Giọng nữ miền Bắc nhẹ nhàng, truyền cảm, thích hợp đọc truyện và trợ lý ảo"
+    },
+    "baotrang": {
+        "id": "baotrang",
+        "name": "Bảo Trang",
+        "gender": "nữ",
+        "tags": ["trưởng thành", "tin tức", "rõ ràng", "trung tính"],
+        "description": "Giọng nữ chuẩn biên tập viên tin tức, rõ ràng, dứt khoát"
+    },
+    "kimoanh": {
+        "id": "kimoanh",
+        "name": "Kim Oanh",
+        "gender": "nữ",
+        "tags": ["trung niên", "kể chuyện", "ấm áp", "truyền cảm"],
+        "description": "Giọng nữ ấm áp, đầm ấm, thích hợp đọc sách nói và tâm sự"
+    },
+    "hamy": {
+        "id": "hamy",
+        "name": "Hà My",
+        "gender": "nữ",
+        "tags": ["trẻ", "hoạt hình", "cao", "biểu cảm"],
+        "description": "Giọng nữ trẻ trung, trong trẻo, hoạt bát, thích hợp hoạt hình và video ngắn"
+    },
+    "giahuy": {
+        "id": "giahuy",
+        "name": "Gia Huy",
+        "gender": "nam",
+        "tags": ["trẻ", "kể chuyện", "trầm ấm", "tâm tình"],
+        "description": "Giọng nam trẻ trầm ấm, mộc mạc, truyền cảm, phù hợp podcast và kể chuyện"
+    },
+    "huuduc": {
+        "id": "huuduc",
+        "name": "Hữu Đức",
+        "gender": "nam",
+        "tags": ["lớn tuổi", "kể chuyện", "trầm", "điềm đạm"],
+        "description": "Giọng nam lớn tuổi điềm đạm, uy nghiêm, giọng đọc phóng sự, tài liệu lịch sử"
+    },
+    "quangminh": {
+        "id": "quangminh",
+        "name": "Quang Minh",
+        "gender": "nam",
+        "tags": ["trẻ", "tin tức", "rõ ràng", "dứt khoát"],
+        "description": "Giọng nam thời sự, dứt khoát, thanh thoát, thích hợp phát thanh và tin nhanh"
+    },
+    "tiendat": {
+        "id": "tiendat",
+        "name": "Tiến Đạt",
+        "gender": "nam",
+        "tags": ["trẻ", "bình luận", "sôi nổi", "năng lượng cao"],
+        "description": "Giọng nam sôi nổi, hào hứng, phù hợp bình luận thể thao, video review"
+    }
+}
 
-@app.get("/health")
+def get_all_voices_list() -> List[Dict[str, Any]]:
+    try:
+        current_names = tts.list_voices()
+    except Exception:
+        current_names = list(BUILTIN_VOICES_INFO.keys())
+
+    voices_list = []
+    for vname in current_names:
+        if vname in BUILTIN_VOICES_INFO:
+            voices_list.append(BUILTIN_VOICES_INFO[vname])
+        else:
+            # Giọng tùy biến nạp thêm từ ngoài
+            voices_list.append({
+                "id": vname,
+                "name": vname.capitalize(),
+                "gender": "tùy biến",
+                "tags": ["custom"],
+                "description": f"Giọng tùy biến '{vname}'"
+            })
+    return voices_list
+
+def synthesize_audio(
+    text: str,
+    voice: str = "maichi",
+    normalize: bool = True,
+    chunk_long_form: bool = True,
+    cfg_scale: float = 1.0
+) -> np.ndarray:
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Nội dung 'input' hoặc 'text' không được để trống.")
+    
+    # 1. Chuẩn hóa tiếng Việt (ngày tháng, giờ, tiền tệ, từ viết tắt...)
+    processed_text = normalize_vi_text(text) if normalize else text.strip()
+
+    # 2. Kiểm tra giọng đọc
+    available_voices = tts.list_voices()
+    if voice not in available_voices and available_voices:
+        voice = available_voices[0]
+
+    # 3. Phân đoạn thông minh cho văn bản dài theo kiến trúc ZeroTTS
+    # Giúp âm thanh mượt mà, không bị hiện tượng lặp âm ở văn bản nhiều câu
+    need_chunk = chunk_long_form and (
+        len(processed_text) > 120 or "\n" in processed_text or sum(processed_text.count(p) for p in [".", "?", "!", ";"]) > 1
+    )
+
+    if need_chunk:
+        segments = [
+            clean_segment_punctuation(s)
+            for s in chunk_text(normalize_punctuation(processed_text), max_chunk_sec=12.0)
+        ]
+        segments = [s for s in segments if s.strip()]
+        if len(segments) > 1:
+            chunks = [tts.synthesize(seg, voice=voice, cfg_scale=cfg_scale) for seg in segments]
+            audio = concat_with_silence(chunks, silence_sec=0.15, sample_rate=tts.sample_rate)
+            return np.asarray(audio).squeeze()
+
+    audio = tts.synthesize(processed_text, voice=voice, cfg_scale=cfg_scale)
+    return np.asarray(audio).squeeze()
+
+def encode_to_wav(audio_arr: np.ndarray, sample_rate: int) -> bytes:
+    audio_int16 = (np.clip(audio_arr, -1.0, 1.0) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    wavfile.write(buf, sample_rate, audio_int16)
+    return buf.getvalue()
+
+# ==============================================================================
+# PYDANTIC SCHEMAS
+# ==============================================================================
+class OpenAISpeechRequest(BaseModel):
+    model: Optional[str] = Field("zerotts", description="Tên mô hình (ví dụ: 'zerotts', 'tts-1', 'tts-1-hd')")
+    input: str = Field(..., description="Văn bản cần đọc")
+    voice: Optional[str] = Field("maichi", description="Giọng đọc: maichi, baotrang, kimoanh, hamy, giahuy, huuduc, quangminh, tiendat")
+    response_format: Optional[str] = Field("wav", description="Định dạng âm thanh trả về ('wav')")
+    speed: Optional[float] = Field(1.0, description="Tốc độ đọc (1.0 mặc định)")
+    normalize: Optional[bool] = Field(True, description="Tự động chuẩn hóa số, ngày giờ, viết tắt tiếng Việt")
+    chunk_long_form: Optional[bool] = Field(True, description="Tự động phân đoạn thông minh văn bản dài")
+    cfg_scale: Optional[float] = Field(1.0, description="Trọng số bám sát đặc trưng giọng đọc (1.0 - 2.0)")
+
+class SynthesizeRequest(BaseModel):
+    text: str = Field(..., description="Văn bản tiếng Việt cần đọc")
+    voice: Optional[str] = Field("maichi", description="Tên giọng đọc")
+    normalize: Optional[bool] = Field(True, description="Chuẩn hóa ngày giờ, số, tiền tệ")
+    chunk_long_form: Optional[bool] = Field(True, description="Phân đoạn thông minh cho văn bản dài")
+    cfg_scale: Optional[float] = Field(1.0, description="Trọng số giọng")
+    return_base64: Optional[bool] = Field(False, description="Nếu True sẽ trả về chuỗi Base64 thay vì file nhị phân WAV")
+
+class NormalizeRequest(BaseModel):
+    input: str = Field(..., description="Văn bản gốc cần kiểm tra chuẩn hóa")
+
+# ==============================================================================
+# CÁC ENDPOINT CHÍNH
+# ==============================================================================
+
+@app.get("/health", summary="Kiểm tra tình trạng máy chủ & GPU")
 def health():
     providers_in_use = []
     try:
@@ -315,65 +472,156 @@ def health():
         "sample_rate": tts.sample_rate,
         "device": DEVICE,
         "providers": providers_in_use,
-        "using_gpu": using_gpu
+        "using_gpu": using_gpu,
+        "total_voices": len(get_all_voices_list())
     }
 
-@app.get("/v1/audio/voices")
+@app.get("/v1/models", summary="Danh sách models (Chuẩn OpenAI)")
+@app.get("/models", summary="Danh sách models")
+def list_models():
+    """Trả về danh sách models chuẩn OpenAI để Dify, NextChat, Open-WebUI dễ dàng kết nối."""
+    return {
+        "object": "list",
+        "data": [
+            {"id": "zerotts", "object": "model", "created": 1700000000, "owned_by": "zeroweight-ai"},
+            {"id": "tts-1", "object": "model", "created": 1700000000, "owned_by": "zeroweight-ai"},
+            {"id": "tts-1-hd", "object": "model", "created": 1700000000, "owned_by": "zeroweight-ai"}
+        ]
+    }
+
+@app.get("/v1/audio/voices", summary="Danh sách giọng đọc chi tiết")
+@app.get("/api/voices", summary="Danh sách giọng đọc chi tiết (REST)")
 def get_voices():
-    try:
-        voices = tts.list_voices()
-    except Exception:
-        voices = ["maichi"]
-    default_voice = voices[0] if voices else "maichi"
-    return {"voices": voices, "default": default_voice}
+    """Trả về danh sách đầy đủ 8 giọng đọc tiếng Việt kèm thông tin giới tính, phong cách."""
+    voices_list = get_all_voices_list()
+    default_voice = voices_list[0]["id"] if voices_list else "maichi"
+    return {
+        "default": default_voice,
+        "voices": [v["id"] for v in voices_list],
+        "details": voices_list
+    }
 
-@app.post("/v1/audio/speech")
-def text_to_speech(req: SpeechRequest):
-    if not req.input or not req.input.strip():
-        raise HTTPException(status_code=400, detail="Nội dung 'input' không được để trống.")
-    
-    # Kiểm tra và resolve giọng đọc
-    try:
-        available_voices = tts.list_voices()
-    except Exception:
-        available_voices = ["maichi"]
-
-    voice_name = req.voice
-    if not voice_name or (voice_name not in available_voices and available_voices):
-        voice_name = available_voices[0] if available_voices else "maichi"
-
+@app.post("/v1/audio/speech", summary="Tạo âm thanh chuẩn OpenAI Speech API")
+def openai_speech(req: OpenAISpeechRequest):
+    """
+    Endpoint tương thích 100% chuẩn OpenAI `/v1/audio/speech`.
+    Các ứng dụng như NextChat, Dify, LibreChat, Open-WebUI có thể trỏ trực tiếp Base URL vào đây.
+    """
     start_time = time.time()
-    
     try:
-        # Gọi ZeroTTS tổng hợp giọng nói (trả về numpy array float32)
-        audio = tts.synthesize(req.input, voice=voice_name)
-
-        # Chuyển đổi float32 [-1.0, 1.0] sang 16-bit PCM WAV và ghi vào BytesIO bằng scipy
-        audio_arr = np.asarray(audio).squeeze()
-        audio_int16 = (np.clip(audio_arr, -1.0, 1.0) * 32767).astype(np.int16)
-        wav_io = io.BytesIO()
-        from scipy.io import wavfile
-        wavfile.write(wav_io, tts.sample_rate, audio_int16)
-        wav_io.seek(0)
-        
+        audio_arr = synthesize_audio(
+            text=req.input,
+            voice=req.voice or "maichi",
+            normalize=req.normalize,
+            chunk_long_form=req.chunk_long_form,
+            cfg_scale=req.cfg_scale or 1.0
+        )
+        wav_bytes = encode_to_wav(audio_arr, tts.sample_rate)
         proc_time = round((time.time() - start_time) * 1000, 2)
-        print(f"[+] Tạo âm thanh thành công cho {len(req.input)} ký tự trong {proc_time}ms (Voice: {voice_name})")
-        
+        duration_sec = round(len(audio_arr) / tts.sample_rate, 2)
+
         return Response(
-            content=wav_io.read(),
+            content=wav_bytes,
             media_type="audio/wav",
             headers={
                 "Content-Disposition": "attachment; filename=speech.wav",
-                "X-Process-Time-Ms": str(proc_time)
+                "X-Process-Time-Ms": str(proc_time),
+                "X-Audio-Duration-Sec": str(duration_sec)
             }
         )
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
-        print(f"[!] Lỗi phát sinh trong synthesize: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Lỗi tạo âm thanh: {str(e)}")
 
-@app.get("/", response_class=HTMLResponse)
+@app.post("/api/synthesize", summary="Tạo âm thanh qua REST API (Hỗ trợ Base64)")
+def api_synthesize(req: SynthesizeRequest):
+    """
+    Endpoint REST API đa năng cho Backend/Microservices.
+    Hỗ trợ xuất trực tiếp file WAV hoặc mã hóa chuỗi JSON Base64.
+    """
+    start_time = time.time()
+    try:
+        audio_arr = synthesize_audio(
+            text=req.text,
+            voice=req.voice or "maichi",
+            normalize=req.normalize,
+            chunk_long_form=req.chunk_long_form,
+            cfg_scale=req.cfg_scale or 1.0
+        )
+        wav_bytes = encode_to_wav(audio_arr, tts.sample_rate)
+        proc_time = round((time.time() - start_time) * 1000, 2)
+        duration_sec = round(len(audio_arr) / tts.sample_rate, 2)
+
+        if req.return_base64:
+            b64_str = base64.b64encode(wav_bytes).decode("utf-8")
+            return {
+                "success": True,
+                "audio_base64": b64_str,
+                "format": "audio/wav",
+                "duration_sec": duration_sec,
+                "process_time_ms": proc_time,
+                "sample_rate": tts.sample_rate,
+                "voice": req.voice
+            }
+
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": "attachment; filename=synthesized.wav",
+                "X-Process-Time-Ms": str(proc_time),
+                "X-Audio-Duration-Sec": str(duration_sec)
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/normalize", summary="Kiểm tra cách đọc số & viết tắt tiếng Việt")
+def api_normalize(req: NormalizeRequest):
+    """
+    Xem trước cách ZeroTTS diễn giải ngày tháng (23/8/2026), giờ (15h30),
+    số tiền (1.250.000đ), số thập phân (12,5) và từ viết tắt sang chữ tiếng Việt.
+    """
+    orig = req.input
+    expanded = normalize_vi_text(orig)
+    return {
+        "original": orig,
+        "normalized": expanded
+    }
+
+@app.post("/api/voices/upload", summary="Nạp thêm Voice Pack tùy biến (.zip)")
+async def upload_voice(file: UploadFile = File(...)):
+    """
+    Nạp thêm giọng đọc mới từ file `.zip` (xuất từ platform zeroweight.ai).
+    Giọng mới sẽ có hiệu lực ngay lập tức mà không cần khởi động lại server.
+    """
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file .zip voice pack.")
+    
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        if hasattr(tts, "add_voices"):
+            names = tts.add_voices(tmp_path)
+            return {"success": True, "message": f"Đã nạp thành công {len(names)} giọng mới", "voices": names}
+        else:
+            from zerotts.voices import install_voice_zip
+            names = install_voice_zip(tmp_path)
+            return {"success": True, "message": f"Đã nạp thành công {len(names)} giọng mới", "voices": names}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi nạp giọng: {str(e)}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+@app.get("/", response_class=HTMLResponse, summary="Giao diện WebUI & Tài liệu API")
 def index():
     return """
     <!DOCTYPE html>
@@ -381,15 +629,18 @@ def index():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>ZeroTTS Studio - Vietnamese Speech AI</title>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+        <title>ZeroTTS Vietnamese Studio & API Hub</title>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
         <style>
             :root {
-                --bg: #090d16;
+                --bg: #0b0f19;
                 --card: #131b2e;
-                --border: #232f48;
+                --card-alt: #1a243c;
+                --border: #23314e;
                 --primary: #3b82f6;
                 --primary-hover: #2563eb;
+                --success: #10b981;
+                --warning: #f59e0b;
                 --text: #f8fafc;
                 --muted: #94a3b8;
             }
@@ -398,34 +649,71 @@ def index():
                 background-color: var(--bg);
                 color: var(--text);
                 margin: 0;
-                padding: 40px 20px;
+                padding: 30px 20px;
                 display: flex;
                 justify-content: center;
             }
-            .container {
-                max-width: 680px;
+            .wrapper {
+                max-width: 900px;
                 width: 100%;
-                background: var(--card);
-                border: 1px solid var(--border);
-                border-radius: 16px;
-                padding: 32px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+            }
+            .header-bar {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                flex-wrap: wrap;
+                margin-bottom: 24px;
+                gap: 12px;
             }
             h1 {
-                margin-top: 0;
+                margin: 0;
                 font-size: 26px;
-                color: #fff;
                 display: flex;
                 align-items: center;
                 gap: 12px;
-                flex-wrap: wrap;
             }
-            p.desc {
-                color: var(--muted);
-                margin-top: -6px;
+            .badges {
+                display: flex;
+                gap: 8px;
+            }
+            .badge {
+                padding: 5px 12px;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            .badge-primary { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+            .badge-gpu { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+            .badge-cpu { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+            
+            .nav-tabs {
+                display: flex;
+                gap: 8px;
+                border-bottom: 1px solid var(--border);
                 margin-bottom: 24px;
-                font-size: 14px;
-                line-height: 1.5;
+            }
+            .nav-tab {
+                padding: 12px 20px;
+                cursor: pointer;
+                font-weight: 600;
+                color: var(--muted);
+                border-bottom: 2px solid transparent;
+                transition: all 0.2s;
+            }
+            .nav-tab.active {
+                color: #60a5fa;
+                border-bottom: 2px solid #3b82f6;
+            }
+            .tab-pane { display: none; }
+            .tab-pane.active { display: block; }
+
+            .card {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 28px;
+                box-shadow: 0 16px 36px rgba(0,0,0,0.4);
+                margin-bottom: 24px;
             }
             label {
                 display: block;
@@ -437,34 +725,57 @@ def index():
             textarea {
                 width: 100%;
                 box-sizing: border-box;
-                background: #0b1120;
+                background: #090e1a;
                 border: 1px solid var(--border);
-                border-radius: 10px;
+                border-radius: 12px;
                 color: #fff;
-                padding: 14px;
+                padding: 16px;
                 font-size: 15px;
-                min-height: 120px;
+                min-height: 110px;
                 resize: vertical;
                 outline: none;
-                transition: border-color 0.2s;
+                line-height: 1.6;
             }
             textarea:focus { border-color: var(--primary); }
-            .grid {
+
+            .quick-samples {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+                margin-top: 10px;
+            }
+            .chip {
+                background: var(--card-alt);
+                border: 1px solid var(--border);
+                color: #94a3b8;
+                padding: 4px 10px;
+                border-radius: 6px;
+                font-size: 12px;
+                cursor: pointer;
+                transition: all 0.2s;
+            }
+            .chip:hover {
+                color: #fff;
+                border-color: #3b82f6;
+            }
+
+            .grid-2 {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
                 gap: 16px;
                 margin-top: 18px;
             }
-            select {
+            select, input[type="text"] {
                 width: 100%;
-                background: #0b1120;
+                background: #090e1a;
                 border: 1px solid var(--border);
                 color: #fff;
                 border-radius: 8px;
-                padding: 10px;
+                padding: 11px 14px;
                 outline: none;
+                box-sizing: border-box;
             }
-            button {
+            .btn {
                 width: 100%;
                 background: var(--primary);
                 color: white;
@@ -474,14 +785,25 @@ def index():
                 font-size: 16px;
                 font-weight: 600;
                 cursor: pointer;
-                margin-top: 24px;
-                transition: background 0.2s, transform 0.1s;
+                margin-top: 20px;
+                transition: background 0.2s;
             }
-            button:hover { background: var(--primary-hover); }
-            button:active { transform: scale(0.99); }
-            button:disabled { opacity: 0.6; cursor: not-allowed; }
+            .btn:hover { background: var(--primary-hover); }
+            .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+            .preview-norm {
+                background: #090e1a;
+                border: 1px dashed var(--border);
+                border-radius: 10px;
+                padding: 12px 16px;
+                font-size: 13px;
+                margin-top: 12px;
+                color: #38bdf8;
+                display: none;
+            }
+
             .player-box {
-                margin-top: 28px;
+                margin-top: 24px;
                 padding: 20px;
                 background: #090e1a;
                 border-radius: 12px;
@@ -490,72 +812,222 @@ def index():
             }
             audio { width: 100%; margin-top: 8px; }
             .stats {
-                font-size: 12px;
+                font-size: 13px;
                 color: var(--muted);
-                margin-top: 8px;
+                margin-top: 10px;
+                display: flex;
+                justify-content: space-between;
+                flex-wrap: wrap;
             }
-            .badge {
-                padding: 4px 10px;
-                border-radius: 6px;
-                font-size: 12px;
-                font-weight: 600;
+
+            /* Code block style */
+            pre, code {
+                font-family: 'JetBrains Mono', monospace;
             }
-            .badge-primary {
-                background: rgba(59, 130, 246, 0.2);
+            .code-block {
+                background: #090e1a;
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                padding: 16px;
+                overflow-x: auto;
+                font-size: 13px;
+                color: #e2e8f0;
+                line-height: 1.5;
+                margin-top: 10px;
+            }
+            .doc-link-btn {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                background: rgba(59, 130, 246, 0.15);
                 color: #60a5fa;
+                border: 1px solid rgba(59, 130, 246, 0.3);
+                padding: 8px 16px;
+                border-radius: 8px;
+                font-size: 14px;
+                font-weight: 600;
+                text-decoration: none;
+                margin-bottom: 20px;
             }
-            .badge-gpu {
-                background: rgba(16, 185, 129, 0.2);
-                color: #34d399;
-                border: 1px solid rgba(16, 185, 129, 0.3);
-            }
-            .badge-cpu {
-                background: rgba(245, 158, 11, 0.2);
-                color: #fbbf24;
-                border: 1px solid rgba(245, 158, 11, 0.3);
-            }
+            .doc-link-btn:hover { background: rgba(59, 130, 246, 0.25); }
         </style>
     </head>
     <body>
-        <div class="container">
-            <h1>🎙️ ZeroTTS Studio <span class="badge badge-primary">Vietnamese AI</span> <span id="gpuBadge" class="badge badge-cpu">Đang kiểm tra...</span></h1>
-            <p class="desc">Chuyển văn bản thành giọng nói Tiếng Việt siêu nhanh và tự nhiên với ZeroTTS trên máy chủ.</p>
-            
-            <label for="text">Nhập văn bản Tiếng Việt:</label>
-            <textarea id="text" placeholder="Nhập câu tiếng Việt bất kỳ...">Xin chào các bạn! Mình là mô hình giọng nói nhân tạo ZeroTTS, hỗ trợ Tiếng Việt tự nhiên và siêu nhanh.</textarea>
-            
-            <div class="grid">
-                <div>
-                    <label for="voice">Giọng đọc (Voice):</label>
-                    <select id="voice">
-                        <option value="maichi">Mai Chi (Giọng nữ tự nhiên)</option>
-                    </select>
-                </div>
-                <div>
-                    <label>Chuẩn kết nối:</label>
-                    <select disabled>
-                        <option>OpenAI Audio Speech API</option>
-                    </select>
+        <div class="wrapper">
+            <div class="header-bar">
+                <h1>🎙️ ZeroTTS Studio <span class="badge badge-primary">Vietnamese AI</span></h1>
+                <div class="badges">
+                    <span id="gpuBadge" class="badge badge-cpu">Đang kiểm tra...</span>
+                    <span id="voiceCountBadge" class="badge badge-primary">8 Giọng đọc</span>
                 </div>
             </div>
 
-            <button id="btn" onclick="generateSpeech()">⚡ Phát sinh giọng nói</button>
+            <div class="nav-tabs">
+                <div class="nav-tab active" onclick="switchTab('studio')">🎧 Trải nghiệm giọng nói</div>
+                <div class="nav-tab" onclick="switchTab('api-docs')">⚡ Hướng dẫn tích hợp API</div>
+                <div class="nav-tab" onclick="switchTab('voices-tab')">🗣️ Danh sách giọng đọc</div>
+            </div>
 
-            <div class="player-box" id="playerBox">
-                <label>Kết quả phát âm thanh:</label>
-                <audio id="audioPlayer" controls></audio>
-                <div class="stats" id="stats"></div>
+            <!-- TAB 1: STUDIO -->
+            <div id="tab-studio" class="tab-pane active">
+                <div class="card">
+                    <label for="textInput">Nhập văn bản tiếng Việt:</label>
+                    <textarea id="textInput">Hôm nay ngày 30/4 lúc 15h30, hệ thống ZeroTTS chạy thử nghiệm tốc độ cao với 8 giọng đọc tiếng Việt cực kỳ tự nhiên.</textarea>
+                    
+                    <div class="quick-samples">
+                        <span class="chip" onclick="setSample('greeting')">👋 Câu chào mừng</span>
+                        <span class="chip" onclick="setSample('news')">📰 Bản tin công nghệ</span>
+                        <span class="chip" onclick="setSample('numbers')">🔢 Số tiền & Ngày giờ</span>
+                        <span class="chip" onclick="checkNormalize()">🔍 Xem cách đọc số</span>
+                    </div>
+
+                    <div id="normPreview" class="preview-norm"></div>
+
+                    <div class="grid-2">
+                        <div>
+                            <label for="voiceSelect">Giọng đọc (Voice):</label>
+                            <select id="voiceSelect"></select>
+                        </div>
+                        <div>
+                            <label for="speedSelect">Tốc độ & Tính năng:</label>
+                            <select id="featureSelect">
+                                <option value="norm">Tự động chuẩn hóa số & từ viết tắt (Khuyên dùng)</option>
+                                <option value="raw">Giữ nguyên văn bản gốc</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <button id="genBtn" class="btn" onclick="generateSpeech()">⚡ Phát sinh giọng nói</button>
+
+                    <div id="playerBox" class="player-box">
+                        <label>🔊 Bản phát âm thanh kết quả:</label>
+                        <audio id="audioPlayer" controls></audio>
+                        <div class="stats" id="statsBox"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- TAB 2: API DOCS -->
+            <div id="tab-api-docs" class="tab-pane">
+                <div class="card">
+                    <a href="/docs" target="_blank" class="doc-link-btn">📖 Mở Swagger Interactive API Docs ↗</a>
+                    <a href="/redoc" target="_blank" class="doc-link-btn" style="margin-left:8px;">📄 Mở ReDoc ↗</a>
+                    
+                    <h3>1. Tích hợp chuẩn OpenAI Audio Speech API (`/v1/audio/speech`)</h3>
+                    <p style="color:var(--muted); font-size:14px;">Trỏ Base URL của các ứng dụng (Dify, NextChat, Open-WebUI, LibreChat) vào <code>http://&lt;IP-MÁY-CHỦ&gt;:8002/v1</code></p>
+                    <div class="code-block">curl -X POST http://localhost:8002/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "zerotts",
+    "input": "Hôm nay thời tiết rất đẹp, chúc bạn một ngày làm việc hiệu quả!",
+    "voice": "maichi"
+  }' --output speech.wav</div>
+
+                    <h3 style="margin-top:24px;">2. Tích hợp bằng Python (OpenAI SDK chính thức)</h3>
+                    <div class="code-block">from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8002/v1", api_key="none")
+
+response = client.audio.speech.create(
+    model="zerotts",
+    voice="maichi",
+    input="Xin chào bạn! ZeroTTS hỗ trợ tiếng Việt cực kỳ tự nhiên và siêu tốc."
+)
+response.stream_to_file("output.wav")</div>
+
+                    <h3 style="margin-top:24px;">3. Tích hợp bằng Node.js / TypeScript</h3>
+                    <div class="code-block">import fs from "fs";
+import OpenAI from "openai";
+
+const openai = new OpenAI({
+  baseURL: "http://localhost:8002/v1",
+  apiKey: "none"
+});
+
+async function main() {
+  const mp3 = await openai.audio.speech.create({
+    model: "zerotts",
+    voice: "maichi",
+    input: "Xin chào thế giới! Đây là âm thanh từ ZeroTTS."
+  });
+  const buffer = Buffer.from(await mp3.arrayBuffer());
+  await fs.promises.writeFile("output.wav", buffer);
+}
+main();</div>
+
+                    <h3 style="margin-top:24px;">4. Gọi trực tiếp bằng JSON API (Nhận Base64 cho Web/App)</h3>
+                    <div class="code-block">curl -X POST http://localhost:8002/api/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Chào bạn, đây là dữ liệu âm thanh trả về dạng Base64.",
+    "voice": "maichi",
+    "return_base64": true
+  }'</div>
+                </div>
+            </div>
+
+            <!-- TAB 3: VOICES LIST -->
+            <div id="tab-voices-tab" class="tab-pane">
+                <div class="card" id="voicesContainer">
+                    <p style="color:var(--muted)">Đang tải danh sách giọng đọc...</p>
+                </div>
             </div>
         </div>
 
         <script>
             let isUsingGpu = false;
+            let currentVoices = [];
+
+            const SAMPLES = {
+                greeting: "Xin chào quý vị và các bạn! Cảm ơn mọi người đã theo dõi buổi phát thanh ngày hôm nay.",
+                news: "Thị trường công nghệ tuần qua ghi nhận nhiều bước đột phá của các mô hình trí tuệ nhân tạo nguồn mở, giúp rút ngắn thời gian xử lý và tối ưu hóa chi phí vận hành cho doanh nghiệp.",
+                numbers: "Vào ngày 30/4/2026 lúc 14h30, phiên bản v2.5 sẽ được phân phối với mức chi phí 1.500.000 đồng, giảm 20% so với dự kiến."
+            };
+
+            function switchTab(tab) {
+                document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+                if (tab === 'studio') {
+                    document.querySelectorAll('.nav-tab')[0].classList.add('active');
+                    document.getElementById('tab-studio').classList.add('active');
+                } else if (tab === 'api-docs') {
+                    document.querySelectorAll('.nav-tab')[1].classList.add('active');
+                    document.getElementById('tab-api-docs').classList.add('active');
+                } else if (tab === 'voices-tab') {
+                    document.querySelectorAll('.nav-tab')[2].classList.add('active');
+                    document.getElementById('tab-voices-tab').classList.add('active');
+                }
+            }
+
+            function setSample(key) {
+                document.getElementById('textInput').value = SAMPLES[key];
+                document.getElementById('normPreview').style.display = 'none';
+            }
+
+            async function checkNormalize() {
+                const text = document.getElementById('textInput').value;
+                if (!text.trim()) return;
+                try {
+                    const res = await fetch('/api/normalize', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({input: text})
+                    });
+                    const d = await res.json();
+                    const box = document.getElementById('normPreview');
+                    box.style.display = 'block';
+                    box.innerHTML = '<strong>Đọc thực tế:</strong> "' + d.normalized + '"';
+                } catch(e) {
+                    console.warn(e);
+                }
+            }
+
             window.addEventListener('DOMContentLoaded', async () => {
                 try {
                     const hRes = await fetch('/health');
                     const hData = await hRes.json();
-                    const badge = document.getElementById('gpuBadge');
                     isUsingGpu = hData.using_gpu;
+                    const badge = document.getElementById('gpuBadge');
                     if (hData.using_gpu) {
                         badge.className = 'badge badge-gpu';
                         badge.innerText = '⚡ GPU NVIDIA (CUDA)';
@@ -563,36 +1035,53 @@ def index():
                         badge.className = 'badge badge-cpu';
                         badge.innerText = '💻 CPU Mode';
                     }
-                } catch(e) {
-                    console.warn(e);
-                }
+                } catch(e) { console.warn(e); }
 
                 try {
-                    const res = await fetch('/v1/audio/voices');
-                    const data = await res.json();
-                    const sel = document.getElementById('voice');
-                    if (data.voices && data.voices.length > 0) {
-                        sel.innerHTML = '';
-                        data.voices.forEach(v => {
-                            const opt = document.createElement('option');
-                            opt.value = v;
-                            opt.textContent = v === 'maichi' ? 'Mai Chi (Nữ - Mặc định)' : v;
-                            sel.appendChild(opt);
-                        });
-                        if (data.default) sel.value = data.default;
-                    }
-                } catch (e) {
-                    console.warn('Lỗi lấy danh sách giọng:', e);
-                }
+                    const vRes = await fetch('/v1/audio/voices');
+                    const vData = await vRes.json();
+                    currentVoices = vData.details || [];
+                    document.getElementById('voiceCountBadge').innerText = currentVoices.length + ' Giọng đọc';
+
+                    const sel = document.getElementById('voiceSelect');
+                    sel.innerHTML = '';
+                    currentVoices.forEach(v => {
+                        const opt = document.createElement('option');
+                        opt.value = v.id;
+                        opt.textContent = `${v.name} (${v.gender.toUpperCase()} - ${v.tags.slice(0, 2).join(', ')})`;
+                        sel.appendChild(opt);
+                    });
+
+                    // Render voices tab
+                    const vc = document.getElementById('voicesContainer');
+                    let html = '<h3 style="margin-top:0">Danh sách 8 Giọng đọc chuẩn tích hợp:</h3>';
+                    html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">';
+                    currentVoices.forEach(v => {
+                        html += `
+                        <div style="background:var(--card-alt); border:1px solid var(--border); border-radius:10px; padding:16px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                                <strong style="font-size:16px; color:#fff;">${v.name} (<code>${v.id}</code>)</strong>
+                                <span class="badge badge-primary">${v.gender}</span>
+                            </div>
+                            <p style="font-size:13px; color:var(--muted); margin:6px 0;">${v.description}</p>
+                            <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;">
+                                ${(v.tags || []).map(t => `<span class="chip" style="font-size:11px;">#${t}</span>`).join('')}
+                            </div>
+                        </div>`;
+                    });
+                    html += '</div>';
+                    vc.innerHTML = html;
+                } catch(e) { console.warn(e); }
             });
 
             async function generateSpeech() {
-                const text = document.getElementById('text').value;
-                const voice = document.getElementById('voice').value;
-                const btn = document.getElementById('btn');
+                const text = document.getElementById('textInput').value;
+                const voice = document.getElementById('voiceSelect').value;
+                const feature = document.getElementById('featureSelect').value;
+                const btn = document.getElementById('genBtn');
                 const playerBox = document.getElementById('playerBox');
                 const player = document.getElementById('audioPlayer');
-                const stats = document.getElementById('stats');
+                const stats = document.getElementById('statsBox');
 
                 if (!text.trim()) {
                     alert('Vui lòng nhập văn bản!');
@@ -600,14 +1089,18 @@ def index():
                 }
 
                 btn.disabled = true;
-                btn.innerText = '⏳ Đang tạo âm thanh...';
+                btn.innerText = '⏳ Đang tổng hợp giọng nói...';
 
                 const t0 = performance.now();
                 try {
                     const response = await fetch('/v1/audio/speech', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ input: text, voice: voice })
+                        body: JSON.stringify({
+                            input: text,
+                            voice: voice,
+                            normalize: feature === 'norm'
+                        })
                     });
 
                     if (!response.ok) {
@@ -618,13 +1111,15 @@ def index():
                     const blob = await response.blob();
                     const audioUrl = URL.createObjectURL(blob);
                     const elapsed = Math.round(performance.now() - t0);
-                    const modeTxt = isUsingGpu ? 'GPU CUDA' : 'CPU';
+                    const modeTxt = isUsingGpu ? '⚡ GPU CUDA' : '💻 CPU';
+                    const procHdr = response.headers.get('X-Process-Time-Ms') || elapsed;
+                    const durHdr = response.headers.get('X-Audio-Duration-Sec') || '';
 
                     player.src = audioUrl;
                     playerBox.style.display = 'block';
-                    stats.innerText = `Thời gian xử lý: ${elapsed} ms (${modeTxt}) | Chuẩn: WAV 48kHz PCM`;
+                    stats.innerHTML = `<span>⏱️ Xử lý: <strong>${procHdr} ms</strong> (${modeTxt})</span> <span>🎧 Độ dài audio: <strong>${durHdr}s</strong> (48kHz WAV PCM)</span>`;
                     player.play();
-                } catch (e) {
+                } catch(e) {
                     alert('Lỗi: ' + e.message);
                 } finally {
                     btn.disabled = false;
@@ -665,12 +1160,13 @@ RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
     zerotts \
     onnxruntime-gpu \
     fastapi \
-    uvicorn \
+    "uvicorn[standard]" \
     soundfile \
     scipy \
     numpy \
     huggingface-hub \
-    pydantic
+    pydantic \
+    python-multipart
 
 COPY server.py /app/server.py
 
@@ -776,7 +1272,7 @@ deploy_with_python_systemd() {
 
     echo -e "${BLUE}ℹ Đang nâng cấp pip và cài đặt gói ZeroTTS...${NC}"
     pip install --upgrade pip setuptools wheel
-    pip install "zerotts" "fastapi" "uvicorn" "pydantic" "soundfile" "scipy" "numpy" "huggingface-hub"
+    pip install "zerotts" "fastapi" "uvicorn[standard]" "pydantic" "soundfile" "scipy" "numpy" "huggingface-hub" "python-multipart"
 
     if [ "$HAS_NVIDIA_GPU" = true ]; then
         pip install "onnxruntime-gpu" || pip install "onnxruntime"
@@ -822,47 +1318,68 @@ post_install_guide() {
     get_server_ips
 
     echo -e "\n${CYAN}${BOLD}=================================================================${NC}"
-    echo -e "${GREEN}${BOLD}         🎉 CÀI ĐẶT & KHỞI CHẠY ZEROTTS THÀNH CÔNG!              ${NC}"
+    echo -e "${GREEN}${BOLD}         🎉 CÀI ĐẶT & KHỞI CHẠY ZEROTTS API THÀNH CÔNG!         ${NC}"
     echo -e "${CYAN}${BOLD}=================================================================${NC}\n"
 
-    echo -e "${BOLD}📌 THÔNG TIN TRUY CẬP:${NC}"
-    echo -e "   • Giao diện WebUI thử giọng:   ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}${NC}"
-    echo -e "   • Base URL (Mạng ngoài):       ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}/v1${NC}"
-    echo -e "   • Localhost:                  ${GREEN}http://127.0.0.1:${PORT}${NC}"
-    echo -e "   • Chế độ chạy:                ${CYAN}${BOLD}${MODE^^}${NC} (Tăng tốc: ${DEVICE^^})"
+    echo -e "${BOLD}📌 THÔNG TIN TRUY CẬP HỆ THỐNG:${NC}"
+    echo -e "   • Giao diện WebUI & Studio:    ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}${NC}"
+    echo -e "   • Tài liệu Swagger API Docs:   ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}/docs${NC}"
+    echo -e "   • Tài liệu kỹ thuật ReDoc:     ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}/redoc${NC}"
+    echo -e "   • Base URL (Chuẩn OpenAI):     ${GREEN}${BOLD}http://${PUBLIC_IP}:${PORT}/v1${NC}"
+    echo -e "   • Chế độ tăng tốc:            ${CYAN}${BOLD}${DEVICE^^}${NC} (Nền tảng: ${MODE^^})"
 
     echo -e "\n${BOLD}📋 LỆNH QUẢN LÝ DỊCH VỤ:${NC}"
     if [ "$MODE" = "docker" ]; then
-        echo -e "   • Xem live logs:     ${BOLD}docker logs -f ${DOCKER_CONTAINER_NAME}${NC}"
-        echo -e "   • Kiểm tra trạng thái: ${BOLD}docker ps -f name=${DOCKER_CONTAINER_NAME}${NC}"
-        echo -e "   • Khởi động lại:     ${BOLD}docker restart ${DOCKER_CONTAINER_NAME}${NC}"
-        echo -e "   • Dừng dịch vụ:      ${BOLD}docker stop ${DOCKER_CONTAINER_NAME}${NC}"
+        echo -e "   • Xem live logs:       ${BOLD}docker logs -f ${DOCKER_CONTAINER_NAME}${NC}"
+        echo -e "   • Kiểm tra container:  ${BOLD}docker ps -f name=${DOCKER_CONTAINER_NAME}${NC}"
+        echo -e "   • Khởi động lại:       ${BOLD}docker restart ${DOCKER_CONTAINER_NAME}${NC}"
+        echo -e "   • Dừng dịch vụ:        ${BOLD}docker stop ${DOCKER_CONTAINER_NAME}${NC}"
     else
-        echo -e "   • Xem live logs:     ${BOLD}journalctl -u ${SYSTEMD_SERVICE} -f${NC}"
-        echo -e "   • Kiểm tra status:   ${BOLD}systemctl status ${SYSTEMD_SERVICE}${NC}"
-        echo -e "   • Khởi động lại:     ${BOLD}systemctl restart ${SYSTEMD_SERVICE}${NC}"
-        echo -e "   • Dừng dịch vụ:      ${BOLD}systemctl stop ${SYSTEMD_SERVICE}${NC}"
+        echo -e "   • Xem live logs:       ${BOLD}journalctl -u ${SYSTEMD_SERVICE} -f${NC}"
+        echo -e "   • Kiểm tra status:     ${BOLD}systemctl status ${SYSTEMD_SERVICE}${NC}"
+        echo -e "   • Khởi động lại:       ${BOLD}systemctl restart ${SYSTEMD_SERVICE}${NC}"
+        echo -e "   • Dừng dịch vụ:        ${BOLD}systemctl stop ${SYSTEMD_SERVICE}${NC}"
     fi
 
-    echo -e "\n${BOLD}💻 VÍ DỤ GỌI API CHUẨN OPENAI (TÍCH HỢP CHO HỆ THỐNG KHÁC):${NC}"
-    echo -e "${YELLOW}1. Bằng cURL (Tải file âm thanh speech.wav):${NC}"
+    echo -e "\n${BOLD}🌐 CẤU HÌNH KẾT NỐI VÀO CÁC NỀN TẢNG AI (Dify, NextChat, Open-WebUI, Hermes Agent):${NC}"
+    echo -e "   • ${YELLOW}Base URL / Endpoint:${NC}  ${BOLD}http://${PUBLIC_IP}:${PORT}/v1${NC}"
+    echo -e "   • ${YELLOW}API Key:${NC}              ${BOLD}none${NC} (hoặc chuỗi bất kỳ)"
+    echo -e "   • ${YELLOW}TTS Model Name:${NC}       ${BOLD}zerotts${NC} (hoặc ${BOLD}tts-1${NC})"
+    echo -e "   • ${YELLOW}Voice Name (8 Giọng):${NC} ${BOLD}maichi${NC} (Nữ - Mặc định), ${BOLD}baotrang${NC} (Nữ tin tức), ${BOLD}giahuy${NC} (Nam ấm), ${BOLD}quangminh${NC} (Nam thời sự), ${BOLD}kimoanh${NC}, ${BOLD}huuduc${NC}, ${BOLD}hamy${NC}, ${BOLD}tiendat${NC}"
+
+    echo -e "\n${BOLD}💻 CODE MẪU GỌI API CHO CÁC HỆ THỐNG KHÁC:${NC}"
+    echo -e "${YELLOW}1. cURL (Gọi OpenAI Speech & tải file WAV):${NC}"
     echo -e "${CYAN}curl -X POST http://${PUBLIC_IP}:${PORT}/v1/audio/speech \\"
     echo -e "  -H \"Content-Type: application/json\" \\"
     echo -e "  -d '{"
     echo -e "    \"model\": \"zerotts\","
-    echo -e "    \"input\": \"Xin chào bạn, ZeroTTS đọc tiếng Việt rất tự nhiên.\","
+    echo -e "    \"input\": \"Hôm nay ngày 30/4 lúc 15h30, hệ thống ZeroTTS đọc tiếng Việt rất tự nhiên.\","
     echo -e "    \"voice\": \"maichi\""
     echo -e "  }' --output speech.wav${NC}"
 
-    echo -e "\n${YELLOW}2. Bằng Python (OpenAI SDK):${NC}"
+    echo -e "\n${YELLOW}2. Python (Dùng thư viện chính thức OpenAI SDK):${NC}"
     echo -e "${CYAN}from openai import OpenAI"
     echo -e "client = OpenAI(base_url=\"http://${PUBLIC_IP}:${PORT}/v1\", api_key=\"none\")"
     echo -e "response = client.audio.speech.create("
     echo -e "    model=\"zerotts\","
     echo -e "    voice=\"maichi\","
-    echo -e "    input=\"Hôm nay trời rất đẹp, chúc bạn một ngày làm việc hiệu quả!\""
+    echo -e "    input=\"Xin chào bạn! ZeroTTS hỗ trợ tiếng Việt cực kỳ mượt mà trên GPU NVIDIA.\""
     echo -e ")"
     echo -e "response.stream_to_file(\"output.wav\")${NC}"
+
+    echo -e "\n${YELLOW}3. Node.js / TypeScript (Fetch hoặc OpenAI SDK):${NC}"
+    echo -e "${CYAN}const fs = require('fs');"
+    echo -e "fetch('http://${PUBLIC_IP}:${PORT}/v1/audio/speech', {"
+    echo -e "  method: 'POST',"
+    echo -e "  headers: { 'Content-Type': 'application/json' },"
+    echo -e "  body: JSON.stringify({ model: 'zerotts', input: 'Xin chào thế giới!', voice: 'maichi' })"
+    echo -e "}).then(res => res.arrayBuffer())"
+    echo -e "  .then(buf => fs.writeFileSync('output.wav', Buffer.from(buf)));${NC}"
+
+    echo -e "\n${YELLOW}4. REST API nhận dữ liệu Base64 (Microservice Backend):${NC}"
+    echo -e "${CYAN}curl -X POST http://${PUBLIC_IP}:${PORT}/api/synthesize \\"
+    echo -e "  -H \"Content-Type: application/json\" \\"
+    echo -e "  -d '{\"text\": \"Chào bạn!\", \"voice\": \"maichi\", \"return_base64\": true}'${NC}"
 
     echo -e "\n${CYAN}=================================================================${NC}\n"
 }
@@ -929,16 +1446,24 @@ view_logs() {
 # Test tạo âm thanh thử nghiệm qua CLI
 test_synthesis() {
     load_config
+    echo -e "\n${BLUE}ℹ Kiểm tra phản hồi API tại http://127.0.0.1:${PORT}/health...${NC}"
+    HEALTH_RES=$(curl -s --max-time 3 "http://127.0.0.1:${PORT}/health" 2>/dev/null || echo "")
+    if [ -n "$HEALTH_RES" ]; then
+        echo -e "${GREEN}✓ Trạng thái hệ thống:${NC} ${CYAN}${HEALTH_RES}${NC}"
+    fi
+
     echo -e "\n${BLUE}ℹ Đang gửi request test tạo âm thanh tới http://127.0.0.1:${PORT}/v1/audio/speech...${NC}"
     
     local OUT_FILE="/tmp/zerotts_test.wav"
     rm -f "$OUT_FILE"
 
+    local T0
+    T0=$(date +%s%N 2>/dev/null || date +%s)
     HTTP_CODE=$(curl -s -w "%{http_code}" -X POST "http://127.0.0.1:${PORT}/v1/audio/speech" \
         -H "Content-Type: application/json" \
         -d '{
             "model": "zerotts",
-            "input": "Xin chào! Đây là bản tin thử nghiệm âm thanh tiếng Việt từ mô hình ZeroTTS.",
+            "input": "Xin chào! Đây là bản tin thử nghiệm âm thanh tiếng Việt từ hệ thống ZeroTTS API.",
             "voice": "maichi"
         }' -o "$OUT_FILE" || echo "000")
 
