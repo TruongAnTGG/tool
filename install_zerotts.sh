@@ -278,25 +278,40 @@ print(f"[*] Khởi tạo ZeroTTS model '{MODEL_ID}' (Cấu hình thiết bị: {
 
 # Khởi tạo Execution Providers cho ONNX Runtime
 providers = ["CPUExecutionProvider"]
+cuda_error_detail = None
 if DEVICE == "cuda":
     try:
         import onnxruntime as ort
         avail_providers = ort.get_available_providers()
         print(f"[*] ONNX Runtime Available Providers: {avail_providers}")
         if "CUDAExecutionProvider" in avail_providers:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            providers = [
+                ("CUDAExecutionProvider", {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kNextPowerOfTwo",
+                    "cudnn_conv_algo_search": "DEFAULT",
+                    "do_copy_in_default_stream": True,
+                }),
+                "CPUExecutionProvider"
+            ]
             print("[+] KÍCH HOẠT TĂNG TỐC GPU: ['CUDAExecutionProvider', 'CPUExecutionProvider']")
         else:
-            print("[!] Không tìm thấy CUDAExecutionProvider trong ONNX Runtime, sẽ chạy trên CPU.")
+            cuda_error_detail = f"CUDAExecutionProvider không có trong danh sách: {avail_providers}"
+            print(f"[!] {cuda_error_detail}")
     except Exception as e:
-        print(f"[!] Lỗi khi kiểm tra providers: {e}")
+        cuda_error_detail = f"Lỗi ONNX provider: {e}"
+        print(f"[!] {cuda_error_detail}")
 
 try:
     tts = ZeroTTS.from_pretrained(MODEL_ID, providers=providers)
     active_providers = tts.prefix_step_sess.get_providers()
     print(f"[+] Tải ZeroTTS model thành công! Providers đang dùng: {active_providers}, Sample rate: {tts.sample_rate}Hz")
+    if DEVICE == "cuda" and "CUDAExecutionProvider" not in active_providers:
+        print("[!] CẢNH BÁO: ONNX Runtime đã tự động fallback về CPU!")
+        cuda_error_detail = "ONNX Runtime fallback về CPU (thiếu CUDA/cuDNN runtime hoặc conflict package)"
 except Exception as e:
     print(f"[!] Lỗi khi nạp model với providers {providers}: {e}")
+    cuda_error_detail = str(e)
     if providers != ["CPUExecutionProvider"]:
         print("[*] Đang fallback sang CPUExecutionProvider...")
         tts = ZeroTTS.from_pretrained(MODEL_ID, providers=["CPUExecutionProvider"])
@@ -473,7 +488,8 @@ def health():
         "device": DEVICE,
         "providers": providers_in_use,
         "using_gpu": using_gpu,
-        "total_voices": len(get_all_voices_list())
+        "total_voices": len(get_all_voices_list()),
+        "cuda_error": cuda_error_detail if not using_gpu else None
     }
 
 @app.get("/v1/models", summary="Danh sách models (Chuẩn OpenAI)")
@@ -1141,7 +1157,10 @@ create_dockerfile() {
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
@@ -1155,10 +1174,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Cài đặt các gói phụ thuộc, gỡ sạch onnxruntime CPU và chỉ cài duy nhất onnxruntime-gpu
+# (Bản zerotts mặc định có onnxruntime CPU trong dependencies gây conflict đè mất CUDAExecutionProvider)
 RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
     pip3 install --no-cache-dir \
-    zerotts \
-    onnxruntime-gpu \
     fastapi \
     "uvicorn[standard]" \
     soundfile \
@@ -1166,7 +1185,12 @@ RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
     numpy \
     huggingface-hub \
     pydantic \
-    python-multipart
+    python-multipart \
+    tokenizers \
+    sounddevice && \
+    pip3 install --no-cache-dir --no-deps zerotts && \
+    pip3 uninstall -y onnxruntime 2>/dev/null || true && \
+    pip3 install --no-cache-dir onnxruntime-gpu
 
 COPY server.py /app/server.py
 
@@ -1272,10 +1296,12 @@ deploy_with_python_systemd() {
 
     echo -e "${BLUE}ℹ Đang nâng cấp pip và cài đặt gói ZeroTTS...${NC}"
     pip install --upgrade pip setuptools wheel
-    pip install "zerotts" "fastapi" "uvicorn[standard]" "pydantic" "soundfile" "scipy" "numpy" "huggingface-hub" "python-multipart"
+    pip install "fastapi" "uvicorn[standard]" "pydantic" "soundfile" "scipy" "numpy" "huggingface-hub" "python-multipart" "tokenizers" "sounddevice"
+    pip install --no-deps "zerotts"
+    pip uninstall -y onnxruntime 2>/dev/null || true
 
     if [ "$HAS_NVIDIA_GPU" = true ]; then
-        pip install "onnxruntime-gpu" || pip install "onnxruntime"
+        pip install "onnxruntime-gpu"
         DEVICE="cuda"
     else
         pip install "onnxruntime"
