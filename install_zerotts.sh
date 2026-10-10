@@ -260,15 +260,39 @@ app.add_middleware(
 )
 
 MODEL_ID = os.getenv("MODEL_REPO", "zeroweight-ai/ZeroTTS")
-DEVICE = os.getenv("DEVICE", "cuda")
+DEVICE = os.getenv("DEVICE", "cuda").lower()
 
-print(f"[*] Đang tải ZeroTTS model '{MODEL_ID}' (Target Device: {DEVICE})...")
+print(f"[*] Khởi tạo ZeroTTS model '{MODEL_ID}' (Target Device: {DEVICE})...")
+
+# ZeroTTS mặc định chỉ dùng CPUExecutionProvider nếu không truyền providers cụ thể.
+# Vì vậy cần khai báo rõ CUDAExecutionProvider để kích hoạt GPU NVIDIA.
+providers = ["CPUExecutionProvider"]
+if DEVICE == "cuda":
+    try:
+        import onnxruntime as ort
+        avail_providers = ort.get_available_providers()
+        print(f"[*] ONNX Runtime Available Providers: {avail_providers}")
+        if "CUDAExecutionProvider" in avail_providers:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            print("[+] KÍCH HOẠT TĂNG TỐC GPU: ['CUDAExecutionProvider', 'CPUExecutionProvider']")
+        else:
+            print("[!] Không tìm thấy CUDAExecutionProvider trong ONNX Runtime, sẽ chạy trên CPU.")
+    except Exception as e:
+        print(f"[!] Lỗi khi kiểm tra providers: {e}")
+
 try:
-    tts = ZeroTTS.from_pretrained(MODEL_ID)
-    print(f"[+] Tải ZeroTTS model thành công! Sample rate: {tts.sample_rate}Hz")
+    tts = ZeroTTS.from_pretrained(MODEL_ID, providers=providers)
+    active_providers = tts.prefix_step_sess.get_providers()
+    print(f"[+] Tải ZeroTTS model thành công! Providers đang dùng: {active_providers}, Sample rate: {tts.sample_rate}Hz")
 except Exception as e:
-    print(f"[!] Lỗi khi nạp model: {e}")
-    raise e
+    print(f"[!] Lỗi khi nạp model với providers {providers}: {e}")
+    if providers != ["CPUExecutionProvider"]:
+        print("[*] Đang fallback sang CPUExecutionProvider...")
+        tts = ZeroTTS.from_pretrained(MODEL_ID, providers=["CPUExecutionProvider"])
+        active_providers = tts.prefix_step_sess.get_providers()
+        print(f"[+] Fallback CPU thành công! Providers: {active_providers}")
+    else:
+        raise e
 
 class SpeechRequest(BaseModel):
     model: Optional[str] = "zerotts"
@@ -279,11 +303,19 @@ class SpeechRequest(BaseModel):
 
 @app.get("/health")
 def health():
+    providers_in_use = []
+    try:
+        providers_in_use = tts.prefix_step_sess.get_providers()
+    except Exception:
+        pass
+    using_gpu = "CUDAExecutionProvider" in providers_in_use
     return {
         "status": "healthy",
         "model": MODEL_ID,
         "sample_rate": tts.sample_rate,
-        "device": DEVICE
+        "device": DEVICE,
+        "providers": providers_in_use,
+        "using_gpu": using_gpu
     }
 
 @app.get("/v1/audio/voices")
@@ -313,15 +345,15 @@ def text_to_speech(req: SpeechRequest):
     start_time = time.time()
     
     try:
-        # Gọi ZeroTTS tổng hợp giọng nói (trả về numpy array shape 1, T)
+        # Gọi ZeroTTS tổng hợp giọng nói (trả về numpy array float32)
         audio = tts.synthesize(req.input, voice=voice_name)
 
-        # Chuẩn hóa về 1D float32 trước khi ghi vào soundfile
-        audio_data = np.asarray(audio, dtype=np.float32).squeeze()
-
-        # Lưu vào buffer WAV chuẩn 16-bit PCM (chống lỗi kênh âm thanh soundfile)
+        # Chuyển đổi float32 [-1.0, 1.0] sang 16-bit PCM WAV và ghi vào BytesIO bằng scipy
+        audio_arr = np.asarray(audio).squeeze()
+        audio_int16 = (np.clip(audio_arr, -1.0, 1.0) * 32767).astype(np.int16)
         wav_io = io.BytesIO()
-        sf.write(wav_io, audio_data, tts.sample_rate, format='WAV', subtype='PCM_16')
+        from scipy.io import wavfile
+        wavfile.write(wav_io, tts.sample_rate, audio_int16)
         wav_io.seek(0)
         
         proc_time = round((time.time() - start_time) * 1000, 2)
@@ -386,6 +418,7 @@ def index():
                 display: flex;
                 align-items: center;
                 gap: 12px;
+                flex-wrap: wrap;
             }
             p.desc {
                 color: var(--muted);
@@ -462,19 +495,31 @@ def index():
                 margin-top: 8px;
             }
             .badge {
-                background: rgba(59, 130, 246, 0.2);
-                color: #60a5fa;
-                padding: 4px 8px;
+                padding: 4px 10px;
                 border-radius: 6px;
                 font-size: 12px;
                 font-weight: 600;
+            }
+            .badge-primary {
+                background: rgba(59, 130, 246, 0.2);
+                color: #60a5fa;
+            }
+            .badge-gpu {
+                background: rgba(16, 185, 129, 0.2);
+                color: #34d399;
+                border: 1px solid rgba(16, 185, 129, 0.3);
+            }
+            .badge-cpu {
+                background: rgba(245, 158, 11, 0.2);
+                color: #fbbf24;
+                border: 1px solid rgba(245, 158, 11, 0.3);
             }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🎙️ ZeroTTS Studio <span class="badge">Vietnamese AI</span></h1>
-            <p class="desc">Chuyển văn bản thành giọng nói Tiếng Việt siêu nhanh (~70ms) và tự nhiên với ZeroTTS.</p>
+            <h1>🎙️ ZeroTTS Studio <span class="badge badge-primary">Vietnamese AI</span> <span id="gpuBadge" class="badge badge-cpu">Đang kiểm tra...</span></h1>
+            <p class="desc">Chuyển văn bản thành giọng nói Tiếng Việt siêu nhanh và tự nhiên với ZeroTTS trên máy chủ.</p>
             
             <label for="text">Nhập văn bản Tiếng Việt:</label>
             <textarea id="text" placeholder="Nhập câu tiếng Việt bất kỳ...">Xin chào các bạn! Mình là mô hình giọng nói nhân tạo ZeroTTS, hỗ trợ Tiếng Việt tự nhiên và siêu nhanh.</textarea>
@@ -504,7 +549,24 @@ def index():
         </div>
 
         <script>
+            let isUsingGpu = false;
             window.addEventListener('DOMContentLoaded', async () => {
+                try {
+                    const hRes = await fetch('/health');
+                    const hData = await hRes.json();
+                    const badge = document.getElementById('gpuBadge');
+                    isUsingGpu = hData.using_gpu;
+                    if (hData.using_gpu) {
+                        badge.className = 'badge badge-gpu';
+                        badge.innerText = '⚡ GPU NVIDIA (CUDA)';
+                    } else {
+                        badge.className = 'badge badge-cpu';
+                        badge.innerText = '💻 CPU Mode';
+                    }
+                } catch(e) {
+                    console.warn(e);
+                }
+
                 try {
                     const res = await fetch('/v1/audio/voices');
                     const data = await res.json();
@@ -556,10 +618,11 @@ def index():
                     const blob = await response.blob();
                     const audioUrl = URL.createObjectURL(blob);
                     const elapsed = Math.round(performance.now() - t0);
+                    const modeTxt = isUsingGpu ? 'GPU CUDA' : 'CPU';
 
                     player.src = audioUrl;
                     playerBox.style.display = 'block';
-                    stats.innerText = `Hoàn thành trong ${elapsed} ms. Định dạng: WAV (Sample rate: 48kHz)`;
+                    stats.innerText = `Thời gian xử lý: ${elapsed} ms (${modeTxt}) | Chuẩn: WAV 48kHz PCM`;
                     player.play();
                 } catch (e) {
                     alert('Lỗi: ' + e.message);
@@ -580,7 +643,7 @@ EOF
 create_dockerfile() {
     mkdir -p "$INSTALL_DIR"
     cat > "$INSTALL_DIR/Dockerfile" <<'EOF'
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
