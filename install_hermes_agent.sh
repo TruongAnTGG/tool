@@ -2,6 +2,7 @@
 
 # ==============================================================================
 # Script Tự Động Cài Đặt, Cấu Hình & Quản Lý Hermes Agent (Nous Research)
+# Hỗ trợ: Cài đặt Trực tiếp (Native Host) & Triển khai Docker Container
 # Hỗ trợ tự động tích hợp với vLLM Server nội bộ (Port 8888) hoặc Cloud AI Providers
 # Hỗ trợ: Linux (Ubuntu, Debian, CentOS, RHEL, AlmaLinux, RockyLinux) & macOS
 # ==============================================================================
@@ -20,6 +21,9 @@ NC='\033[0m' # No Color
 
 HERMES_CONFIG_DIR="$HOME/.hermes"
 HERMES_CONFIG_FILE="$HERMES_CONFIG_DIR/config.yaml"
+HERMES_DOCKER_IMAGE="nousresearch/hermes-agent:latest"
+HERMES_CONTAINER_NAME="hermes-gateway"
+HERMES_COMPOSE_FILE="$HERMES_CONFIG_DIR/docker-compose.yml"
 VLLM_CONF="/etc/vllm/vllm.conf"
 DEFAULT_VLLM_PORT="8888"
 
@@ -28,7 +32,8 @@ show_banner() {
     clear 2>/dev/null || true
     echo -e "${CYAN}${BOLD}=================================================================${NC}"
     echo -e "${CYAN}${BOLD}     HỆ THỐNG CÀI ĐẶT & CẤU HÌNH HERMES AGENT (NOUS RESEARCH)   ${NC}"
-    echo -e "${CYAN}${BOLD}       Autonomous AI Agent - Kết nối vLLM (Port 8888) & Gateway  ${NC}"
+    echo -e "${CYAN}${BOLD}     Hỗ trợ Chạy Trực tiếp (Native) & Docker Container Gateway   ${NC}"
+    echo -e "${CYAN}${BOLD}       Tự động kết nối vLLM (Port 8888) & Quản lý Đa nền tảng    ${NC}"
     echo -e "${CYAN}${BOLD}=================================================================${NC}\n"
 }
 
@@ -69,6 +74,34 @@ detect_os() {
     fi
 }
 
+# Thêm đường dẫn PATH vào bashrc/zshrc
+ensure_path() {
+    local PATHS_TO_CHECK=(
+        "$HOME/.local/bin"
+        "$HOME/.hermes/bin"
+        "/usr/local/bin"
+    )
+
+    mkdir -p "$HOME/.local/bin"
+
+    for p in "${PATHS_TO_CHECK[@]}"; do
+        if [ -d "$p" ]; then
+            case ":$PATH:" in
+                *":$p:"*) ;;
+                *)
+                    export PATH="$p:$PATH"
+                    if [ -f "$HOME/.bashrc" ] && ! grep -q "$p" "$HOME/.bashrc"; then
+                        echo "export PATH=\"$p:\$PATH\"" >> "$HOME/.bashrc"
+                    fi
+                    if [ -f "$HOME/.zshrc" ] && ! grep -q "$p" "$HOME/.zshrc"; then
+                        echo "export PATH=\"$p:\$PATH\"" >> "$HOME/.zshrc"
+                    fi
+                    ;;
+            esac
+        fi
+    done
+}
+
 # Cài đặt các gói phụ thuộc cơ bản
 install_dependencies() {
     echo -e "${BLUE}ℹ Đang kiểm tra và cài đặt các phụ thuộc cần thiết (curl, git, python3)...${NC}"
@@ -97,30 +130,56 @@ install_dependencies() {
     echo -e "${GREEN}✓ Hoàn tất kiểm tra gói phụ thuộc.${NC}"
 }
 
-# Thêm đường dẫn PATH vào bashrc/zshrc
-ensure_path() {
-    local PATHS_TO_CHECK=(
-        "$HOME/.local/bin"
-        "$HOME/.hermes/bin"
-        "/usr/local/bin"
-    )
+# Kiểm tra và đảm bảo Docker đã sẵn sàng
+ensure_docker() {
+    echo -e "\n${BLUE}ℹ Đang kiểm tra môi trường Docker...${NC}"
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠ Chưa tìm thấy Docker trên hệ thống!${NC}"
+        local SCRIPT_DIR
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-    for p in "${PATHS_TO_CHECK[@]}"; do
-        if [ -d "$p" ]; then
-            case ":$PATH:" in
-                *":$p:"*) ;;
-                *)
-                    export PATH="$p:$PATH"
-                    if [ -f "$HOME/.bashrc" ] && ! grep -q "$p" "$HOME/.bashrc"; then
-                        echo "export PATH=\"$p:\$PATH\"" >> "$HOME/.bashrc"
-                    fi
-                    if [ -f "$HOME/.zshrc" ] && ! grep -q "$p" "$HOME/.zshrc"; then
-                        echo "export PATH=\"$p:\$PATH\"" >> "$HOME/.zshrc"
-                    fi
-                    ;;
-            esac
+        if [ -f "$SCRIPT_DIR/install_docker.sh" ]; then
+            echo -e "${CYAN}ℹ Phát hiện script cài đặt Docker trong thư mục: $SCRIPT_DIR/install_docker.sh${NC}"
+            read -rp "Bạn có muốn chạy script cài đặt Docker ngay bây giờ không? [Y/n]: " RUN_DOCKER_INSTALL
+            RUN_DOCKER_INSTALL="${RUN_DOCKER_INSTALL:-Y}"
+            if [[ "$RUN_DOCKER_INSTALL" =~ ^[Yy]$ ]]; then
+                bash "$SCRIPT_DIR/install_docker.sh"
+            else
+                echo -e "${RED}✗ Cần có Docker để tiếp tục tùy chọn Container.${NC}"
+                return 1
+            fi
+        else
+            read -rp "Tự động cài đặt Docker qua script chính thức (get.docker.com)? [Y/n]: " AUTO_INSTALL_DK
+            AUTO_INSTALL_DK="${AUTO_INSTALL_DK:-Y}"
+            if [[ "$AUTO_INSTALL_DK" =~ ^[Yy]$ ]]; then
+                curl -fsSL https://get.docker.com | sh
+                if [ "$EUID" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+                    sudo usermod -aG docker "$USER" 2>/dev/null || true
+                    sudo systemctl enable docker 2>/dev/null || true
+                    sudo systemctl start docker 2>/dev/null || true
+                fi
+            else
+                echo -e "${RED}✗ Vui lòng cài đặt Docker trước khi tiếp tục.${NC}"
+                return 1
+            fi
         fi
-    done
+    fi
+
+    # Kiểm tra quyền truy cập Docker daemon
+    if ! docker info >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠ Không thể kết nối tới Docker daemon (có thể do quyền socket). Đang thử khắc phục...${NC}"
+        if [ "$EUID" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+            sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+            sudo systemctl start docker 2>/dev/null || true
+        fi
+        if ! docker info >/dev/null 2>&1; then
+            echo -e "${RED}✗ Lỗi: Không thể truy cập Docker daemon. Vui lòng kiểm tra dịch vụ Docker (sudo systemctl start docker).${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "${GREEN}✓ Docker đã sẵn sàng hoạt động!${NC}"
+    return 0
 }
 
 # Kiểm tra xem vLLM nội bộ có đang hoạt động không
@@ -130,7 +189,6 @@ check_local_vllm() {
     DETECTED_VLLM_PORT="$DEFAULT_VLLM_PORT"
     DETECTED_API_KEY=""
 
-    # 1. Kiểm tra qua config file nếu tồn tại
     if [ -f "$VLLM_CONF" ]; then
         # shellcheck disable=SC1090
         . "$VLLM_CONF" 2>/dev/null || true
@@ -139,14 +197,12 @@ check_local_vllm() {
         DETECTED_API_KEY="${API_KEY:-}"
     fi
 
-    # 2. Thử truy vấn endpoint /v1/models trên port đã cấu hình hoặc 8888
     local TEST_PORTS=("$DETECTED_VLLM_PORT" "8888" "8000")
     for port in "${TEST_PORTS[@]}"; do
         MODELS_RES=$(curl -s --max-time 2 "http://127.0.0.1:${port}/v1/models" 2>/dev/null || echo "")
         if [[ "$MODELS_RES" =~ "\"id\"" ]] || [[ "$MODELS_RES" =~ "\"data\"" ]]; then
             LOCAL_VLLM_ACTIVE=true
             DETECTED_VLLM_PORT="$port"
-            # Lấy tên model đầu tiên từ json nếu chưa có
             if [ -z "$DETECTED_VLLM_MODEL" ]; then
                 DETECTED_VLLM_MODEL=$(echo "$MODELS_RES" | grep -o '"id": *"[^"]*"' | head -n 1 | cut -d '"' -f 4 || echo "custom-vllm-model")
             fi
@@ -155,17 +211,124 @@ check_local_vllm() {
     done
 }
 
-# Cài đặt Hermes Agent
-install_hermes() {
+# Tạo Docker CLI Wrapper cho lệnh `hermes` trên Host
+create_docker_wrapper() {
+    ensure_path
+    local WRAPPER_PATH="$HOME/.local/bin/hermes"
+    echo -e "${BLUE}ℹ Đang tạo CLI wrapper cho Hermes Container tại ${BOLD}${WRAPPER_PATH}${NC}...${NC}"
+
+    cat > "$WRAPPER_PATH" << 'EOF'
+#!/usr/bin/env bash
+# ==============================================================================
+# Hermes Agent Docker Wrapper
+# Tự động chuyển tiếp các lệnh CLI vào Hermes Docker Container
+# ==============================================================================
+
+HERMES_IMAGE="nousresearch/hermes-agent:latest"
+DATA_DIR="$HOME/.hermes"
+mkdir -p "$DATA_DIR"
+
+# Thiết lập network
+NET_ARGS="--network host"
+if [ "$(uname -s)" = "Darwin" ]; then
+    NET_ARGS="-p 8642:8642 -p 9119:9119 --add-host host.docker.internal:host-gateway"
+fi
+
+exec docker run -it --rm \
+    $NET_ARGS \
+    -v "$DATA_DIR:/opt/data" \
+    -e HERMES_UID="$(id -u)" \
+    -e HERMES_GID="$(id -g)" \
+    "$HERMES_IMAGE" hermes "$@"
+EOF
+
+    chmod +x "$WRAPPER_PATH"
+    echo -e "${GREEN}✓ Đã tạo lệnh wrapper 'hermes' thành công! Giờ bạn có thể gõ trực tiếp 'hermes' trong terminal.${NC}"
+}
+
+# Tạo file docker-compose.yml cho Hermes Gateway
+generate_docker_compose() {
+    mkdir -p "$HERMES_CONFIG_DIR"
+    echo -e "${BLUE}ℹ Đang tạo file cấu hình Docker Compose tại ${HERMES_COMPOSE_FILE}...${NC}"
+
+    local NET_MODE="network_mode: host"
+    local PORT_MAPPING=""
+    if [ "$OS" = "macos" ]; then
+        NET_MODE=""
+        PORT_MAPPING="ports:
+      - \"8642:8642\"
+      - \"9119:9119\"
+    extra_hosts:
+      - \"host.docker.internal:host-gateway\""
+    fi
+
+    cat > "$HERMES_COMPOSE_FILE" <<EOF
+version: '3.8'
+
+services:
+  hermes:
+    image: ${HERMES_DOCKER_IMAGE}
+    container_name: ${HERMES_CONTAINER_NAME}
+    restart: unless-stopped
+    ${NET_MODE}
+    ${PORT_MAPPING}
+    volumes:
+      - ~/.hermes:/opt/data
+    environment:
+      - HERMES_UID=\${HERMES_UID:-$(id -u)}
+      - HERMES_GID=\${HERMES_GID:-$(id -g)}
+    command: ["gateway", "run"]
+EOF
+
+    echo -e "${GREEN}✓ Đã tạo file ${HERMES_COMPOSE_FILE}!${NC}"
+}
+
+# Triển khai Hermes Agent bằng Docker Container
+install_hermes_docker() {
+    echo -e "\n${CYAN}${BOLD}=== TRIỂN KHAI HERMES AGENT BẰNG DOCKER CONTAINER ===${NC}"
+    
+    if ! ensure_docker; then
+        return 1
+    fi
+
+    echo -e "\n${BLUE}ℹ Đang tải Docker Image chính thức: ${BOLD}${HERMES_DOCKER_IMAGE}${NC}...${NC}"
+    docker pull "$HERMES_DOCKER_IMAGE"
+    echo -e "${GREEN}✓ Đã tải Docker Image thành công!${NC}"
+
+    # Tạo các thư mục dữ liệu và phân quyền tránh lỗi attachment / permissions
+    mkdir -p "$HERMES_CONFIG_DIR/cache/exports"
+    mkdir -p "$HERMES_CONFIG_DIR/workspace"
+    chmod -R 775 "$HERMES_CONFIG_DIR" 2>/dev/null || true
+
+    # Tạo Wrapper CLI và Docker Compose
+    create_docker_wrapper
+    generate_docker_compose
+
+    # Tự động cấu hình AI Provider
+    auto_configure_provider
+
+    echo -e "\n${GREEN}${BOLD}🎉 Cài đặt Hermes Agent Container thành công!${NC}"
+    echo -e "   • Dữ liệu lưu trữ tại: ${CYAN}${HERMES_CONFIG_DIR}${NC}"
+    echo -e "   • Docker Compose:      ${CYAN}${HERMES_COMPOSE_FILE}${NC}"
+    echo -e "   • Lệnh tương tác CLI:  ${BOLD}hermes${NC}"
+    echo ""
+
+    read -rp "Bạn có muốn khởi chạy Hermes Gateway Container (chạy nền Telegram/Discord) ngay không? [y/N]: " START_GW
+    if [[ "$START_GW" =~ ^[Yy]$ ]]; then
+        start_gateway_container
+    fi
+}
+
+# Cài đặt Hermes Agent trực tiếp trên Host (Native)
+install_hermes_native() {
     install_dependencies
 
     echo -e "\n${BLUE}ℹ Đang cài đặt Hermes Agent thông qua script chính thức của Nous Research...${NC}"
     
-    # Chạy official installer
     if curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash; then
         echo -e "${GREEN}✓ Đã tải và cài đặt bộ core của Hermes Agent thành công!${NC}"
     else
-        echo -e "${YELLOW}⚠ Cài đặt bằng script trực tuyến gặp trục trặc, chuyển sang cài đặt qua Git + Python Virtualenv...${NC}"
+        echo -e "${YELLOW}⚠ Cài đặt trực tuyến gặp trục trặc, chuyển sang cài đặt qua Git + Python Virtualenv...${NC}"
         local HERMES_INSTALL_DIR="$HOME/.hermes-src"
         rm -rf "$HERMES_INSTALL_DIR"
         git clone https://github.com/NousResearch/hermes-agent.git "$HERMES_INSTALL_DIR"
@@ -185,10 +348,9 @@ install_hermes() {
         HERMES_VERSION=$(hermes --version 2>/dev/null || echo "Hoạt động")
         echo -e "\n${GREEN}${BOLD}🎉 Cài đặt Hermes Agent thành công! (${HERMES_VERSION})${NC}"
     else
-        echo -e "\n${YELLOW}ℹ Lệnh 'hermes' đã được cài vào profile. Vui lòng chạy:${NC} ${BOLD}source ~/.bashrc${NC} (hoặc ~/.zshrc)"
+        echo -e "\n${YELLOW}ℹ Lệnh 'hermes' đã được thêm vào PATH. Vui lòng reload shell: source ~/.bashrc${NC}"
     fi
 
-    # Cấu hình tự động
     auto_configure_provider
 }
 
@@ -244,11 +406,11 @@ EOF
             echo -e "${GREEN}✓ Đã lưu cấu hình OpenRouter vào ${HERMES_CONFIG_FILE}!${NC}"
             ;;
         3)
-            echo -e "${BLUE}ℹ Đang mở xác thực Nous Portal qua trình duyệt hoặc mã code...${NC}"
+            echo -e "${BLUE}ℹ Đang mở xác thực Nous Portal...${NC}"
             if command -v hermes >/dev/null 2>&1; then
                 hermes setup --portal || true
             else
-                echo -e "${YELLOW}Vui lòng chạy 'hermes setup --portal' sau khi reload shell.${NC}"
+                echo -e "${YELLOW}Vui lòng chạy 'hermes setup --portal' sau khi hoàn tất cài đặt.${NC}"
             fi
             ;;
         4)
@@ -267,7 +429,7 @@ EOF
             if command -v hermes >/dev/null 2>&1; then
                 hermes setup || true
             else
-                echo -e "${YELLOW}Vui lòng chạy 'hermes setup' trong terminal.${NC}"
+                echo -e "${YELLOW}Vui lòng chạy 'hermes setup' trong terminal sau khi hoàn tất.${NC}"
             fi
             ;;
     esac
@@ -282,13 +444,19 @@ configure_vllm_connection() {
         api_key="none"
     fi
 
+    # Nếu chạy Docker trên macOS/Windows thì dùng host.docker.internal, trên Linux dùng 127.0.0.1
+    local vllm_host="127.0.0.1"
+    if [ "$OS" = "macos" ]; then
+        vllm_host="host.docker.internal"
+    fi
+
     mkdir -p "$HERMES_CONFIG_DIR"
     cat > "$HERMES_CONFIG_FILE" <<EOF
 # Cấu hình Hermes Agent kết nối vLLM Server nội bộ
 model:
   provider: "custom"
   default: "${model}"
-  base_url: "http://127.0.0.1:${port}/v1"
+  base_url: "http://${vllm_host}:${port}/v1"
   api_key: "${api_key}"
 
 agent:
@@ -298,9 +466,108 @@ agent:
 EOF
 
     echo -e "\n${GREEN}${BOLD}✓ Đã liên kết Hermes Agent thành công với vLLM Server:${NC}"
-    echo -e "   • Base URL: ${CYAN}http://127.0.0.1:${port}/v1${NC}"
+    echo -e "   • Base URL: ${CYAN}http://${vllm_host}:${port}/v1${NC}"
     echo -e "   • Model:    ${CYAN}${model}${NC}"
     echo -e "   • Config:   ${CYAN}${HERMES_CONFIG_FILE}${NC}\n"
+}
+
+# Khởi chạy Hermes Gateway Container
+start_gateway_container() {
+    ensure_docker || return 1
+    echo -e "\n${BLUE}ℹ Đang khởi chạy Hermes Gateway Container (${HERMES_CONTAINER_NAME})...${NC}"
+
+    # Dừng container cũ nếu đang chạy
+    if docker ps -a --format '{{.Names}}' | grep -q "^${HERMES_CONTAINER_NAME}$"; then
+        echo -e "${YELLOW}ℹ Dừng và xóa container cũ...${NC}"
+        docker rm -f "$HERMES_CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+
+    local NET_OPT="--network host"
+    if [ "$OS" = "macos" ]; then
+        NET_OPT="-p 8642:8642 -p 9119:9119 --add-host host.docker.internal:host-gateway"
+    fi
+
+    mkdir -p "$HOME/.hermes"
+    chmod -R 775 "$HOME/.hermes" 2>/dev/null || true
+
+    # Khởi chạy container với UID/GID chuẩn của user hiện tại
+    docker run -d \
+        --name "$HERMES_CONTAINER_NAME" \
+        --restart unless-stopped \
+        $NET_OPT \
+        -v "$HOME/.hermes:/opt/data" \
+        -e HERMES_UID="$(id -u)" \
+        -e HERMES_GID="$(id -g)" \
+        "$HERMES_DOCKER_IMAGE" gateway run
+
+    sleep 2
+    if docker ps --format '{{.Names}}' | grep -q "^${HERMES_CONTAINER_NAME}$"; then
+        echo -e "${GREEN}${BOLD}✓ Container ${HERMES_CONTAINER_NAME} đang chạy nền thành công!${NC}"
+        echo -e "   • Xem logs: ${BOLD}docker logs -f ${HERMES_CONTAINER_NAME}${NC}"
+    else
+        echo -e "${RED}✗ Không thể khởi chạy container. Xem log lỗi:${NC}"
+        docker logs --tail 20 "$HERMES_CONTAINER_NAME"
+    fi
+}
+
+# Dừng Gateway Container
+stop_gateway_container() {
+    if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' | grep -q "^${HERMES_CONTAINER_NAME}$"; then
+        echo -e "${BLUE}ℹ Đang dừng container ${HERMES_CONTAINER_NAME}...${NC}"
+        docker stop "$HERMES_CONTAINER_NAME" >/dev/null 2>&1 || true
+        echo -e "${GREEN}✓ Đã dừng container.${NC}"
+    else
+        echo -e "${YELLOW}ℹ Không tìm thấy container ${HERMES_CONTAINER_NAME} đang chạy.${NC}"
+    fi
+}
+
+# Quản lý Gateway Container (Menu tương tác)
+manage_gateway_container() {
+    while true; do
+        echo -e "\n${CYAN}${BOLD}=== QUẢN LÝ HERMES GATEWAY CONTAINER ===${NC}"
+        local STATUS="${RED}Đã dừng / Chưa tạo${NC}"
+        if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -q "^${HERMES_CONTAINER_NAME}$"; then
+            STATUS="${GREEN}Đang hoạt động (Running)${NC}"
+        fi
+        echo -e "Trạng thái Container [${HERMES_CONTAINER_NAME}]: ${STATUS}\n"
+        echo -e "   1) ${GREEN}Khởi chạy / Restart Gateway Container${NC}"
+        echo -e "   2) ${RED}Dừng Gateway Container${NC}"
+        echo -e "   3) ${YELLOW}Xem Logs Container thời gian thực (docker logs -f)${NC}"
+        echo -e "   4) Mở Terminal bên trong Container (Bash shell)"
+        echo -e "   5) Cập nhật Docker Image mới nhất (docker pull)"
+        echo -e "   0) Quay lại Menu chính"
+        echo ""
+        read -rp "Lựa chọn [0-5]: " GW_CHOICE
+
+        case "$GW_CHOICE" in
+            1)
+                start_gateway_container
+                ;;
+            2)
+                stop_gateway_container
+                ;;
+            3)
+                echo -e "${YELLOW}(Nhấn Ctrl+C để thoát chế độ xem log)${NC}"
+                docker logs -f --tail 100 "$HERMES_CONTAINER_NAME" 2>/dev/null || echo -e "${RED}Container chưa chạy.${NC}"
+                ;;
+            4)
+                if docker ps --format '{{.Names}}' | grep -q "^${HERMES_CONTAINER_NAME}$"; then
+                    docker exec -it "$HERMES_CONTAINER_NAME" bash || docker exec -it "$HERMES_CONTAINER_NAME" sh
+                else
+                    echo -e "${RED}Container không chạy.${NC}"
+                fi
+                ;;
+            5)
+                ensure_docker && docker pull "$HERMES_DOCKER_IMAGE"
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}Lựa chọn không hợp lệ.${NC}"
+                ;;
+        esac
+    done
 }
 
 # Kiểm tra trạng thái và kết nối
@@ -313,8 +580,18 @@ check_status() {
         echo -e "${GREEN}✓ Lệnh 'hermes' đã được cài đặt:${NC} $(which hermes)"
         hermes --version 2>/dev/null || true
     else
-        echo -e "${RED}✗ Không tìm thấy lệnh 'hermes' trong PATH hiện tại.${NC}"
-        echo -e "${YELLOW}ℹ Gợi ý: Hãy chạy lệnh:${NC} ${BOLD}source ~/.bashrc${NC} ${YELLOW}hoặc chạy lại mục 1 để cài đặt.${NC}"
+        echo -e "${YELLOW}⚠ Chưa tìm thấy lệnh 'hermes' trong PATH hiện tại.${NC}"
+    fi
+
+    # Kiểm tra Docker Container
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "\n${BLUE}ℹ Trạng thái Docker:${NC}"
+        if docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -q "$HERMES_CONTAINER_NAME"; then
+            echo -e "${GREEN}✓ Tìm thấy Hermes Container:${NC}"
+            docker ps -a --filter "name=$HERMES_CONTAINER_NAME" --format '   • Tên: {{.Names}} | Trạng thái: {{.Status}} | Image: {{.Image}}'
+        else
+            echo -e "   • Chưa có container ${HERMES_CONTAINER_NAME} nào được tạo."
+        fi
     fi
 
     # Kiểm tra file config
@@ -339,11 +616,11 @@ check_status() {
     echo ""
 }
 
-# Chạy Hermes Agent tương tác
+# Chạy Hermes Agent tương tác CLI
 run_hermes_interactive() {
     ensure_path
     if ! command -v hermes >/dev/null 2>&1; then
-        echo -e "${RED}✗ Lỗi: Chưa tìm thấy lệnh 'hermes'. Hãy chạy cài đặt trước (Mục 1).${NC}"
+        echo -e "${RED}✗ Lỗi: Chưa tìm thấy lệnh 'hermes'. Hãy cài đặt bằng Mục 1 hoặc Mục 2 trước.${NC}"
         return 1
     fi
 
@@ -365,6 +642,34 @@ setup_gateway() {
     fi
 }
 
+# Xem logs (Host hoặc Container)
+view_logs() {
+    echo -e "\n${CYAN}${BOLD}=== XEM LOGS HERMES GATEWAY ===${NC}"
+    echo -e "   1) Xem Docker logs (${HERMES_CONTAINER_NAME})"
+    echo -e "   2) Xem File logs Host (~/.hermes/logs/gateway.log)"
+    echo -e "   0) Quay lại"
+    read -rp "Lựa chọn [0-2]: " LOG_C
+
+    case "$LOG_C" in
+        1)
+            if command -v docker >/dev/null 2>&1; then
+                echo -e "${YELLOW}(Nhấn Ctrl+C để thoát)${NC}"
+                docker logs -f --tail 100 "$HERMES_CONTAINER_NAME" 2>/dev/null || echo -e "${RED}Container chưa được tạo.${NC}"
+            fi
+            ;;
+        2)
+            if [ -f "$HOME/.hermes/logs/gateway.log" ]; then
+                echo -e "${YELLOW}(Nhấn Ctrl+C để thoát)${NC}"
+                tail -n 100 -f "$HOME/.hermes/logs/gateway.log"
+            else
+                echo -e "${YELLOW}Chưa có file log tại ~/.hermes/logs/gateway.log${NC}"
+            fi
+            ;;
+        *)
+            ;;
+    esac
+}
+
 # Gỡ bỏ Hermes Agent
 uninstall_hermes() {
     echo -e "\n${RED}${BOLD}⚠ CẢNH BÁO: BẠN CÓ CHẮC CHẮN MUỐN GỠ BỎ HERMES AGENT?${NC}"
@@ -374,7 +679,14 @@ uninstall_hermes() {
         return 0
     fi
 
-    echo -e "\n${BLUE}ℹ Đang dọn dẹp các thư mục Hermes Agent...${NC}"
+    echo -e "\n${BLUE}ℹ Đang dọn dẹp các tiến trình và Container...${NC}"
+    if command -v docker >/dev/null 2>&1; then
+        docker rm -f "$HERMES_CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+
+    pkill -f "hermes gateway" 2>/dev/null || true
+
+    echo -e "${BLUE}ℹ Đang dọn dẹp các thư mục Hermes Agent...${NC}"
     rm -rf "$HOME/.hermes"
     rm -rf "$HOME/.hermes-src"
     rm -f "$HOME/.local/bin/hermes"
@@ -390,25 +702,31 @@ main_menu() {
     ensure_path
 
     echo -e "${BOLD}Chọn tác vụ bạn muốn thực hiện:${NC}"
-    echo -e "   1) ${GREEN}${BOLD}Cài đặt Hermes Agent (Official Nous Research Installer)${NC}"
-    echo -e "   2) ${CYAN}Liên kết nhanh Hermes Agent với vLLM nội bộ (Port 8888)${NC}"
-    echo -e "   3) ${GREEN}Chạy Hermes Agent tương tác trực tiếp ('hermes')${NC}"
-    echo -e "   4) ${YELLOW}Kiểm tra trạng thái cài đặt & kết nối vLLM${NC}"
-    echo -e "   5) ${MAGENTA}Thiết lập Gateway tin nhắn (Telegram / Discord / Slack)${NC}"
-    echo -e "   6) Đổi Model / Nhà cung cấp AI ('hermes model')${NC}"
-    echo -e "   7) Quản lý Công cụ & Skills ('hermes tools')${NC}"
-    echo -e "   8) ${RED}Gỡ bỏ Hermes Agent${NC}"
+    echo -e "   1) ${MAGENTA}${BOLD}Triển khai Hermes Agent bằng DOCKER CONTAINER [Khuyên dùng cho Server]${NC}"
+    echo -e "   2) ${GREEN}Cài đặt Hermes Agent trực tiếp trên máy chủ (Native Python/Host)${NC}"
+    echo -e "   3) ${CYAN}Liên kết nhanh Hermes Agent với vLLM nội bộ (Port 8888)${NC}"
+    echo -e "   4) ${GREEN}${BOLD}Chạy Hermes Agent tương tác trực tiếp CLI ('hermes')${NC}"
+    echo -e "   5) ${BLUE}Quản lý Gateway Container chạy nền (Telegram / Discord)${NC}"
+    echo -e "   6) ${YELLOW}Kiểm tra trạng thái cài đặt, Docker & kết nối vLLM${NC}"
+    echo -e "   7) Thiết lập Gateway tin nhắn ('hermes gateway setup')"
+    echo -e "   8) Đổi Model / Nhà cung cấp AI ('hermes model')"
+    echo -e "   9) Quản lý Công cụ & Skills ('hermes tools')"
+    echo -e "   10) Xem Logs Gateway (Container / Host)"
+    echo -e "   11) ${RED}Gỡ bỏ Hermes Agent${NC}"
     echo -e "   0) Thoát"
 
     echo ""
-    read -rp "Nhập lựa chọn của bạn [0-8] (Mặc định: 1): " MENU_CHOICE
+    read -rp "Nhập lựa chọn của bạn [0-11] (Mặc định: 1): " MENU_CHOICE
     MENU_CHOICE="${MENU_CHOICE:-1}"
 
     case "$MENU_CHOICE" in
         1)
-            install_hermes
+            install_hermes_docker
             ;;
         2)
+            install_hermes_native
+            ;;
+        3)
             check_local_vllm
             if [ "$LOCAL_VLLM_ACTIVE" = true ]; then
                 configure_vllm_connection "$DETECTED_VLLM_PORT" "$DETECTED_VLLM_MODEL" "$DETECTED_API_KEY"
@@ -421,30 +739,36 @@ main_menu() {
                 configure_vllm_connection "$P" "$M" "$K"
             fi
             ;;
-        3)
+        4)
             run_hermes_interactive
             ;;
-        4)
-            check_status
-            ;;
         5)
-            setup_gateway
+            manage_gateway_container
             ;;
         6)
+            check_status
+            ;;
+        7)
+            setup_gateway
+            ;;
+        8)
             if command -v hermes >/dev/null 2>&1; then
                 hermes model || true
             else
                 auto_configure_provider
             fi
             ;;
-        7)
+        9)
             if command -v hermes >/dev/null 2>&1; then
                 hermes tools || true
             else
                 echo -e "${YELLOW}Vui lòng cài đặt Hermes Agent trước.${NC}"
             fi
             ;;
-        8)
+        10)
+            view_logs
+            ;;
+        11)
             uninstall_hermes
             ;;
         0)
