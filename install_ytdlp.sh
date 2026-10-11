@@ -3,7 +3,8 @@
 # ==============================================================================
 # Script Tự Động Cài Đặt, Cấu Hình & Quản Lý Hệ Thống Tải Video Đa Nền Tảng
 # Nền tảng lõi: yt-dlp (https://github.com/yt-dlp/yt-dlp)
-# Triển khai: Docker & Docker Compose kèm Giao diện MeTube Web UI + CLI Wrapper ytdl
+# Triển khai: Docker & Docker Compose
+# Giao diện: MeTube Web UI + Telegram Bot Tự Động Tải Video + CLI Wrapper ytdl
 # Hỗ trợ tải: YouTube, TikTok, Facebook, Instagram, Twitter/X, Bilibili, Douyin,...
 # Hệ điều hành hỗ trợ: Ubuntu, Debian, CentOS, RHEL, AlmaLinux, RockyLinux, Fedora
 # ==============================================================================
@@ -26,6 +27,7 @@ COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 ENV_FILE="$INSTALL_DIR/.env"
 DOWNLOAD_DIR_DEFAULT="$INSTALL_DIR/downloads"
 COOKIES_DIR="$INSTALL_DIR/cookies"
+BOT_DIR="$INSTALL_DIR/bot"
 DEFAULT_PORT="8282"
 CLI_WRAPPER="/usr/local/bin/ytdl"
 CLI_WRAPPER_ALT="/usr/local/bin/yt-dlp"
@@ -34,8 +36,8 @@ CLI_WRAPPER_ALT="/usr/local/bin/yt-dlp"
 show_banner() {
     clear 2>/dev/null || true
     echo -e "${CYAN}${BOLD}=================================================================${NC}"
-    echo -e "${CYAN}${BOLD}      HỆ THỐNG TẢI VIDEO ĐA NỀN TẢNG (YT-DLP & DOCKER)           ${NC}"
-    echo -e "${CYAN}${BOLD}   Tích Hợp Giao Diện Web MeTube + Công Cụ Dòng Lệnh ytdl/yt-dlp  ${NC}"
+    echo -e "${CYAN}${BOLD}   HỆ THỐNG TẢI VIDEO ĐA NỀN TẢNG (YT-DLP & DOCKER ECOSYSTEM)   ${NC}"
+    echo -e "${CYAN}${BOLD}   MeTube Web UI + Telegram Bot Tải Video Tự Động + CLI ytdl     ${NC}"
     echo -e "${CYAN}${BOLD}=================================================================${NC}\n"
 }
 
@@ -187,6 +189,332 @@ load_config() {
     fi
     PORT="${YTDLP_PORT:-$DEFAULT_PORT}"
     DOWNLOAD_PATH="${YTDLP_DOWNLOAD_DIR:-$DOWNLOAD_DIR_DEFAULT}"
+    BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+    ALLOWED_USERS="${TELEGRAM_ALLOWED_USERS:-}"
+}
+
+# Lưu cấu hình vào file .env
+save_config() {
+    cat > "$ENV_FILE" <<EOF
+YTDLP_PORT=${PORT}
+YTDLP_DOWNLOAD_DIR=${DOWNLOAD_PATH}
+TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
+TELEGRAM_ALLOWED_USERS=${ALLOWED_USERS}
+PUBLIC_IP=${PUBLIC_IP}
+EOF
+    chmod 600 "$ENV_FILE"
+}
+
+# Khởi tạo mã nguồn cho Telegram Bot container
+generate_bot_files() {
+    mkdir -p "$BOT_DIR"
+
+    # 1. Dockerfile cho Telegram Bot
+    cat > "$BOT_DIR/Dockerfile" << 'EOF'
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY bot.py /app/bot.py
+
+CMD ["python", "-u", "bot.py"]
+EOF
+
+    # 2. requirements.txt
+    cat > "$BOT_DIR/requirements.txt" << 'EOF'
+pyTelegramBotAPI>=4.20.0
+yt-dlp>=2025.01.01
+requests>=2.31.0
+EOF
+
+    # 3. bot.py (Xử lý tin nhắn trực tiếp, tag nhóm, tải video/audio & gửi lại Telegram)
+    cat > "$BOT_DIR/bot.py" << 'EOF'
+import os
+import re
+import sys
+import time
+import logging
+import threading
+import telebot
+import yt_dlp
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+ALLOWED_USERS_RAW = os.getenv('TELEGRAM_ALLOWED_USERS', '').strip()
+PUBLIC_IP = os.getenv('PUBLIC_IP', 'localhost').strip()
+WEB_PORT = os.getenv('WEB_PORT', '8282').strip()
+DOWNLOAD_DIR = os.getenv('DOWNLOAD_DIR', '/downloads').strip()
+COOKIES_FILE = '/cookies/cookies.txt'
+
+MAX_TG_SIZE_BYTES = 49 * 1024 * 1024  # 49 MB (ngưỡng an toàn dưới 50MB của Telegram Bot API)
+URL_REGEX = re.compile(r'(https?://[^\s<>"]+|www\.[^\s<>"]+)')
+
+if not BOT_TOKEN:
+    logging.warning("Chưa cấu hình TELEGRAM_BOT_TOKEN. Telegram Bot chuyển sang trạng thái chờ.")
+    while True:
+        time.sleep(3600)
+
+ALLOWED_USERS = set()
+if ALLOWED_USERS_RAW:
+    for uid in ALLOWED_USERS_RAW.split(','):
+        uid = uid.strip()
+        if uid.lstrip('-').isdigit():
+            ALLOWED_USERS.add(int(uid))
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
+try:
+    BOT_INFO = bot.get_me()
+    BOT_USERNAME = (BOT_INFO.username or '').lower()
+    logging.info(f"Bot khởi động thành công: @{BOT_INFO.username} (ID: {BOT_INFO.id})")
+except Exception as e:
+    logging.error(f"Lỗi kết nối Telegram API: {e}")
+    BOT_USERNAME = ""
+
+
+def is_authorized(user_id: int, chat_id: int) -> bool:
+    if not ALLOWED_USERS:
+        return True
+    return (user_id in ALLOWED_USERS) or (chat_id in ALLOWED_USERS)
+
+
+def extract_url(message) -> str:
+    # 1. Tìm trong text của tin nhắn
+    text = message.text or message.caption or ""
+    urls = URL_REGEX.findall(text)
+    if urls:
+        return urls[0]
+    # 2. Nếu là tin reply, tìm trong tin nhắn gốc
+    if message.reply_to_message:
+        rep_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        rep_urls = URL_REGEX.findall(rep_text)
+        if rep_urls:
+            return rep_urls[0]
+    return ""
+
+
+def download_and_process(chat_id: int, msg_id: int, user_id: int, url: str, is_audio: bool = False):
+    status_msg = None
+    try:
+        status_msg = bot.send_message(
+            chat_id,
+            f"⏳ <b>Đang phân tích link và tải về...</b>\n🔗 <code>{url}</code>\n<i>Vui lòng đợi giây lát!</i>",
+            reply_to_message_id=msg_id
+        )
+
+        timestamp = int(time.time())
+        out_template = os.path.join(DOWNLOAD_DIR, f"%(title).60s [%(id)s]_{timestamp}.%(ext)s")
+
+        ydl_opts = {
+            'outtmpl': out_template,
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'socket_timeout': 30,
+        }
+
+        if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
+            ydl_opts['cookiefile'] = COOKIES_FILE
+
+        if is_audio:
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            })
+        else:
+            ydl_opts.update({
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'merge_output_format': 'mp4',
+            })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get('title', 'Video')
+            duration = info.get('duration', 0)
+            width = info.get('width', 0)
+            height = info.get('height', 0)
+            uploader = info.get('uploader', 'N/A')
+
+            filepath = None
+            if 'requested_downloads' in info and info['requested_downloads']:
+                filepath = info['requested_downloads'][0].get('filepath')
+
+            if not filepath or not os.path.exists(filepath):
+                base_name = ydl.prepare_filename(info)
+                if is_audio:
+                    base, _ = os.path.splitext(base_name)
+                    filepath = base + ".mp3"
+                else:
+                    base, _ = os.path.splitext(base_name)
+                    filepath = base + ".mp4"
+
+        if not filepath or not os.path.exists(filepath):
+            raise Exception("Không tìm thấy tệp video sau khi tải về.")
+
+        filesize = os.path.getsize(filepath)
+        filesize_mb = filesize / (1024 * 1024)
+        filename = os.path.basename(filepath)
+
+        if filesize <= MAX_TG_SIZE_BYTES:
+            try:
+                bot.edit_message_text(
+                    f"📤 <b>Đang gửi tệp lên Telegram ({filesize_mb:.1f} MB)...</b>",
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id
+                )
+            except Exception:
+                pass
+
+            if is_audio:
+                bot.send_chat_action(chat_id, 'upload_document')
+                with open(filepath, 'rb') as af:
+                    bot.send_audio(
+                        chat_id,
+                        audio=af,
+                        caption=f"🎵 <b>{title}</b>\n👤 Kênh: {uploader}\n📦 Dung lượng: {filesize_mb:.1f} MB",
+                        reply_to_message_id=msg_id,
+                        duration=duration,
+                        performer=uploader,
+                        title=title
+                    )
+            else:
+                bot.send_chat_action(chat_id, 'upload_video')
+                with open(filepath, 'rb') as vf:
+                    bot.send_video(
+                        chat_id,
+                        video=vf,
+                        caption=f"🎬 <b>{title}</b>\n👤 Kênh: {uploader}\n📦 Dung lượng: {filesize_mb:.1f} MB",
+                        reply_to_message_id=msg_id,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        supports_streaming=True
+                    )
+
+            try:
+                bot.delete_message(chat_id, status_msg.message_id)
+            except Exception:
+                pass
+        else:
+            # Dung lượng > 50MB (vượt giới hạn Telegram API)
+            bot.edit_message_text(
+                f"✅ <b>Tải về máy chủ thành công!</b>\n\n"
+                f"🎬 <b>Tiêu đề:</b> {title}\n"
+                f"📦 <b>Dung lượng:</b> {filesize_mb:.1f} MB (Vượt quá giới hạn 50MB của Telegram Bot)\n\n"
+                f"🔗 <b>Xem hoặc tải trực tiếp tại Web UI:</b>\n"
+                f"http://{PUBLIC_IP}:{WEB_PORT}/\n\n"
+                f"📁 <i>Tên tệp:</i> <code>{filename}</code>",
+                chat_id=chat_id,
+                message_id=status_msg.message_id
+            )
+
+    except Exception as e:
+        logging.error(f"Lỗi khi xử lý link {url}: {e}")
+        err_msg = str(e)
+        if "Sign in to confirm you're not a bot" in err_msg:
+            hint = "YouTube yêu cầu xác minh bot. Hãy bổ sung cookies.txt vào hệ thống."
+        elif "Private video" in err_msg or "Video unavailable" in err_msg:
+            hint = "Video ở chế độ riêng tư hoặc đã bị xóa."
+        else:
+            hint = err_msg[:150]
+
+        reply_err = (
+            f"❌ <b>Không thể tải video từ link!</b>\n"
+            f"⚠️ <i>Nguyên nhân:</i> {hint}\n"
+            f"🔗 <code>{url}</code>"
+        )
+        if status_msg:
+            try:
+                bot.edit_message_text(reply_err, chat_id=chat_id, message_id=status_msg.message_id)
+            except Exception:
+                bot.send_message(chat_id, reply_err, reply_to_message_id=msg_id)
+        else:
+            bot.send_message(chat_id, reply_err, reply_to_message_id=msg_id)
+
+
+@bot.message_handler(commands=['start', 'help'])
+def handle_start(message):
+    if not is_authorized(message.from_user.id, message.chat.id):
+        bot.reply_to(message, "⛔ Bạn không có quyền sử dụng bot này.")
+        return
+
+    welcome_text = (
+        f"👋 <b>Chào mừng bạn đến với Bot Tải Video Đa Nền Tảng!</b>\n"
+        f"<i>(Được vận hành bởi lõi yt-dlp & Docker Engine)</i>\n\n"
+        f"🚀 <b>CÁCH SỬ DỤNG:</b>\n"
+        f"1. <b>Chat 1-1 với Bot:</b> Gửi trực tiếp bất kỳ đường link video nào (YouTube, TikTok, Facebook, Reels, Instagram, Twitter/X, Douyin,...)\n"
+        f"2. <b>Trong Nhóm Chat:</b> Tag <code>@{BOT_USERNAME} [link]</code> hoặc Reply tin nhắn có link video và tag <code>@{BOT_USERNAME}</code>\n"
+        f"3. <b>Tải chỉ tệp âm thanh (MP3):</b> Gõ lệnh <code>/mp3 [link]</code>\n\n"
+        f"🌐 <b>Giao diện Web MeTube:</b>\n"
+        f"<code>http://{PUBLIC_IP}:{WEB_PORT}</code>\n\n"
+        f"💡 <i>Lưu ý: Nếu video > 50MB (giới hạn Telegram), bot sẽ lưu vào máy chủ và gửi link web để bạn tải trực tiếp!</i>"
+    )
+    bot.reply_to(message, welcome_text)
+
+
+@bot.message_handler(commands=['mp3'])
+def handle_mp3_command(message):
+    if not is_authorized(message.from_user.id, message.chat.id):
+        return
+
+    url = extract_url(message)
+    if not url:
+        bot.reply_to(message, "ℹ Vui lòng nhập link video kèm theo lệnh. Ví dụ:\n<code>/mp3 https://vt.tiktok.com/...</code>")
+        return
+
+    threading.Thread(
+        target=download_and_process,
+        args=(message.chat.id, message.message_id, message.from_user.id, url, True)
+    ).start()
+
+
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def handle_text_messages(message):
+    if not is_authorized(message.from_user.id, message.chat.id):
+        return
+
+    text = message.text or ""
+    is_group = message.chat.type in ['group', 'supergroup']
+    
+    # Kiểm tra xem có tag bot hoặc gọi bot trong nhóm không
+    is_tagged = False
+    if is_group:
+        if BOT_USERNAME and f"@{BOT_USERNAME}" in text.lower():
+            is_tagged = True
+        elif message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.username:
+            if message.reply_to_message.from_user.username.lower() == BOT_USERNAME:
+                is_tagged = True
+        elif text.startswith(('/dl', f'/dl@{BOT_USERNAME}')):
+            is_tagged = True
+    else:
+        # Chat riêng 1-1 với Bot
+        is_tagged = True
+
+    url = extract_url(message)
+    if url and is_tagged:
+        is_audio = text.startswith('/mp3')
+        threading.Thread(
+            target=download_and_process,
+            args=(message.chat.id, message.message_id, message.from_user.id, url, is_audio)
+        ).start()
+
+
+if __name__ == '__main__':
+    logging.info("Telegram Bot đang lắng nghe tin nhắn...")
+    bot.infinity_polling(skip_pending=True)
+EOF
 }
 
 # Tạo docker-compose.yml
@@ -196,6 +524,7 @@ generate_docker_compose() {
 
     mkdir -p "$download_dir"
     mkdir -p "$COOKIES_DIR"
+    generate_bot_files
 
     # Tạo tệp cookies.txt mẫu nếu chưa có
     if [ ! -f "$COOKIES_DIR/cookies.txt" ]; then
@@ -234,6 +563,29 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  telegram-bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: ytdlp-telegram-bot
+    restart: unless-stopped
+    volumes:
+      - "${download_dir}:/downloads"
+      - "${COOKIES_DIR}:/cookies:ro"
+    environment:
+      - TELEGRAM_BOT_TOKEN=\${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ALLOWED_USERS=\${TELEGRAM_ALLOWED_USERS:-}
+      - PUBLIC_IP=\${PUBLIC_IP:-localhost}
+      - WEB_PORT=${port}
+      - DOWNLOAD_DIR=/downloads
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - metube
+
 networks:
   default:
     name: ytdlp_network
@@ -255,7 +607,7 @@ if [ -f "/opt/ytdlp/cookies/cookies.txt" ] && [ -s "/opt/ytdlp/cookies/cookies.t
     COOKIES_ARG="-v /opt/ytdlp/cookies/cookies.txt:/cookies/cookies.txt:ro --cookiefile /cookies/cookies.txt"
 fi
 
-# Chạy container jauderho/yt-dlp hoặc ghcr.io/alexta69/metube kèm ffmpeg
+# Chạy container ghcr.io/alexta69/metube kèm ffmpeg
 docker run --rm -i \
     -v "$(pwd)":/workdir \
     -w /workdir \
@@ -268,15 +620,17 @@ EOF
     echo -e "${GREEN}✓ Đã tạo lệnh ${BOLD}ytdl${NC} và ${BOLD}yt-dlp${NC} thành công tại /usr/local/bin!${NC}"
 }
 
-# Triển khai cài đặt hệ thống yt-dlp & MeTube
+# Triển khai cài đặt hệ thống yt-dlp, MeTube & Telegram Bot
 deploy_ytdlp() {
     ensure_docker_and_compose
     detect_os
+    get_server_ips
     mkdir -p "$INSTALL_DIR"
     mkdir -p "$COOKIES_DIR"
+    mkdir -p "$BOT_DIR"
     cd "$INSTALL_DIR"
 
-    echo -e "\n${CYAN}${BOLD}--- CẤU HÌNH THÔNG SỐ YT-DLP & METUBE WEB UI ---${NC}\n"
+    echo -e "\n${CYAN}${BOLD}--- CẤU HÌNH THÔNG SỐ YT-DLP, METUBE & TELEGRAM BOT ---${NC}\n"
 
     # Nhập cổng Web UI
     read -rp "$(echo -e "${BOLD}1. Cổng Web UI (Port)${NC} [Mặc định: ${GREEN}${DEFAULT_PORT}${NC}]: ")" INPUT_PORT
@@ -287,14 +641,16 @@ deploy_ytdlp() {
     DOWNLOAD_PATH="${INPUT_DIR:-$DOWNLOAD_DIR_DEFAULT}"
     mkdir -p "$DOWNLOAD_PATH"
 
-    # Ghi cấu hình ra .env
-    cat > "$ENV_FILE" <<EOF
-YTDLP_PORT=${PORT}
-YTDLP_DOWNLOAD_DIR=${DOWNLOAD_PATH}
-EOF
-    chmod 600 "$ENV_FILE"
+    # Nhập Telegram Bot Token
+    echo -e "\n${BOLD}3. Cấu hình Telegram Bot Token:${NC}"
+    echo -e "   Tạo bot tại ${CYAN}@BotFather${NC} trên Telegram để lấy API Token (dạng: 123456789:ABCdef...)"
+    read -rp "$(echo -e "   Nhập Telegram Bot Token [Bỏ trống nếu chưa dùng]: ")" INPUT_BOT_TOKEN
+    BOT_TOKEN="${INPUT_BOT_TOKEN:-$BOT_TOKEN}"
 
-    # Tạo docker-compose.yml
+    # Ghi cấu hình ra .env
+    save_config
+
+    # Tạo docker-compose.yml và bot files
     generate_docker_compose "$PORT" "$DOWNLOAD_PATH"
 
     # Cài đặt CLI wrapper
@@ -308,12 +664,67 @@ EOF
         run_compose down 2>/dev/null || true
     fi
 
-    echo -e "\n${BLUE}ℹ Đang tải Image Docker (ghcr.io/alexta69/metube:latest) và khởi động container...${NC}"
-    run_compose pull
+    echo -e "\n${BLUE}ℹ Đang tải Image Docker và xây dựng dịch vụ...${NC}"
+    run_compose pull metube
+    run_compose build telegram-bot
     run_compose up -d
 
-    echo -e "\n${GREEN}${BOLD}✓ Khởi tạo hệ thống tải video yt-dlp thành công!${NC}"
+    echo -e "\n${GREEN}${BOLD}✓ Khởi tạo toàn bộ hệ thống tải video thành công!${NC}"
     post_install_guide
+}
+
+# Cấu hình hoặc đổi Telegram Bot Token
+configure_telegram_bot() {
+    load_config
+    get_server_ips
+    echo -e "\n${CYAN}${BOLD}=== CẤU HÌNH TELEGRAM BOT TẢI VIDEO TỰ ĐỘNG ===${NC}\n"
+    if [ -n "$BOT_TOKEN" ]; then
+        echo -e "Token hiện tại: ${GREEN}${BOT_TOKEN:0:10}****************${NC}"
+    else
+        echo -e "Token hiện tại: ${YELLOW}(Chưa cấu hình)${NC}"
+    fi
+
+    echo -e "\n${BOLD}Hướng dẫn tạo Telegram Bot:${NC}"
+    echo -e "1. Mở ứng dụng Telegram, tìm kiếm: ${CYAN}@BotFather${NC}"
+    echo -e "2. Gõ lệnh: ${BOLD}/newbot${NC} và đặt tên cho bot."
+    echo -e "3. Copy chuỗi ${BOLD}HTTP API Token${NC} dán vào dưới đây."
+    echo -e "4. ${YELLOW}MẸO CHO NHÓM:${NC} Trong chat với @BotFather, gõ ${BOLD}/setprivacy${NC} -> Chọn bot của bạn -> Chọn ${BOLD}Disable${NC} (để bot có thể nhận diện link trong nhóm mà không cần quyền Admin).\n"
+
+    read -rp "Nhập Telegram Bot Token mới [Enter để giữ nguyên]: " NEW_TOKEN
+    if [ -n "$NEW_TOKEN" ]; then
+        echo -e "\n${BLUE}ℹ Đang kiểm tra tính hợp lệ của Token với Telegram API...${NC}"
+        BOT_CHECK=$(curl -s --max-time 5 "https://api.telegram.org/bot${NEW_TOKEN}/getMe" || true)
+        if echo "$BOT_CHECK" | grep -q '"ok":true'; then
+            TG_NAME=$(echo "$BOT_CHECK" | grep -o '"username":"[^"]*"' | cut -d'"' -f4 || echo "Bot")
+            echo -e "${GREEN}✓ Kết nối thành công tới Bot: ${BOLD}@${TG_NAME}${NC}!"
+            BOT_TOKEN="$NEW_TOKEN"
+        else
+            echo -e "${RED}✗ Token không hợp lệ hoặc không thể kết nối tới Telegram API!${NC}"
+            echo -e "Phản hồi API: $BOT_CHECK"
+            read -rp "Bạn vẫn muốn lưu token này chứ? (y/N): " FORCE_SAVE
+            if [[ "$FORCE_SAVE" =~ ^[Yy]$ ]]; then
+                BOT_TOKEN="$NEW_TOKEN"
+            else
+                return 1
+            fi
+        fi
+    fi
+
+    read -rp "Nhập ID người dùng / Nhóm được phép tải (Cách nhau bởi dấu phẩy, để trống để cho phép tất cả): " NEW_ALLOWED
+    if [ -n "$NEW_ALLOWED" ]; then
+        ALLOWED_USERS="$NEW_ALLOWED"
+    fi
+
+    save_config
+    generate_docker_compose "$PORT" "$DOWNLOAD_PATH"
+
+    cd "$INSTALL_DIR"
+    echo -e "\n${BLUE}ℹ Đang khởi động lại dịch vụ Telegram Bot...${NC}"
+    run_compose build telegram-bot
+    run_compose up -d --force-recreate telegram-bot
+
+    echo -e "${GREEN}${BOLD}✓ Cấu hình Telegram Bot thành công!${NC}"
+    echo -e "Bây giờ bạn có thể chat trực tiếp hoặc thêm bot vào nhóm và gửi link video để tải!\n"
 }
 
 # Hướng dẫn chi tiết sau khi cài đặt
@@ -322,7 +733,7 @@ post_install_guide() {
     get_server_ips
 
     echo -e "\n${CYAN}${BOLD}=================================================================${NC}"
-    echo -e "${GREEN}${BOLD}    🎉 HỆ THỐNG YT-DLP & METUBE WEB UI ĐÃ SẴN SÀNG HOẠT ĐỘNG!    ${NC}"
+    echo -e "${GREEN}${BOLD}   🎉 HỆ THỐNG YT-DLP, METUBE & TELEGRAM BOT ĐÃ SẴN SÀNG!        ${NC}"
     echo -e "${CYAN}${BOLD}=================================================================${NC}\n"
 
     echo -e "${BOLD}📌 1. TRUY CẬP GIAO DIỆN WEB (TRÌNH DUYỆT ĐIỆN THOẠI / MÁY TÍNH):${NC}"
@@ -330,24 +741,29 @@ post_install_guide() {
     echo -e "   • Truy cập nội bộ mạng LAN:  ${GREEN}${BOLD}http://${LOCAL_IP}:${PORT}${NC}"
     echo -e "   • Localhost:                 ${GREEN}http://127.0.0.1:${PORT}${NC}"
     echo -e "   ${YELLOW}→ Dán link YouTube, TikTok, Facebook, Instagram,... chọn độ phân giải / MP3 rồi bấm Tải!${NC}"
-    echo -e "   ${YELLOW}→ Web UI hỗ trợ tải trực tiếp tệp về máy tính / điện thoại của bạn.${NC}"
 
-    echo -e "\n${BOLD}💻 2. TẢI VIDEO TRỰC TIẾP TỪ DÒNG LỆNH (CLI):${NC}"
-    echo -e "   Bạn có thể dùng lệnh ${CYAN}${BOLD}ytdl${NC} hoặc ${CYAN}${BOLD}yt-dlp${NC} ở bất cứ thư mục nào trên máy chủ:"
+    echo -e "\n${BOLD}🤖 2. TẢI VIDEO QUA TELEGRAM BOT (CHAT RIÊNG & NHÓM):${NC}"
+    if [ -n "$BOT_TOKEN" ]; then
+        echo -e "   • ${GREEN}Trạng thái: ĐÃ KÍCH HOẠT${NC}"
+        echo -e "   • Gửi link trực tiếp trong chat 1-1 với Bot để tải video."
+        echo -e "   • Trong nhóm chat: Tag ${BOLD}@bot_username [link]${NC} hoặc Reply tin nhắn có link kèm tag bot."
+        echo -e "   • Tách nhạc MP3: Gõ lệnh ${BOLD}/mp3 [link]${NC}."
+    else
+        echo -e "   • ${YELLOW}Trạng thái: CHƯA CẤU HÌNH TOKEN${NC}"
+        echo -e "   • Chọn lựa chọn số ${BOLD}2${NC} trong Menu để cấu hình Telegram Bot Token bất kỳ lúc nào."
+    fi
+
+    echo -e "\n${BOLD}💻 3. TẢI VIDEO TRỰC TIẾP TỪ DÒNG LỆNH (CLI):${NC}"
     echo -e "   • Tải video chất lượng tốt nhất:"
     echo -e "     ${GREEN}ytdl \"https://www.youtube.com/watch?v=VIDEO_ID\"${NC}"
     echo -e "   • Tải tách lấy file âm thanh MP3:"
-    echo -e "     ${GREEN}ytdl -x --audio-format mp3 \"https://www.youtube.com/watch?v=VIDEO_ID\"${NC}"
-    echo -e "   • Tải video TikTok / Facebook / Douyin không logo / chất lượng cao:"
-    echo -e "     ${GREEN}ytdl \"https://vt.tiktok.com/ZS...\"${NC}"
-    echo -e "   • Xem danh sách định dạng có sẵn của link:"
-    echo -e "     ${GREEN}ytdl -F \"LINK_VIDEO\"${NC}"
+    echo -e "     ${GREEN}ytdl -x --audio-format mp3 \"https://vt.tiktok.com/ZSxxxx/\"${NC}"
 
-    echo -e "\n${BOLD}📁 3. THƯ MỤC LƯU TRỮ TRÊN MÁY CHỦ:${NC}"
+    echo -e "\n${BOLD}📁 4. THƯ MỤC LƯU TRỮ TRÊN MÁY CHỦ:${NC}"
     echo -e "   • Thư mục video đã tải:  ${MAGENTA}${BOLD}${DOWNLOAD_PATH}${NC}"
     echo -e "   • Thư mục cookies:       ${MAGENTA}${COOKIES_DIR}/cookies.txt${NC}"
 
-    echo -e "\n${BOLD}📋 4. LỆNH QUẢN LÝ NHANH DỊCH VỤ:${NC}"
+    echo -e "\n${BOLD}📋 5. LỆNH QUẢN LÝ NHANH DỊCH VỤ:${NC}"
     echo -e "   • Xem logs tải video:    ${BOLD}cd ${INSTALL_DIR} && docker compose logs -f${NC}"
     echo -e "   • Khởi động lại:         ${BOLD}cd ${INSTALL_DIR} && docker compose restart${NC}"
     echo -e "   • Dừng dịch vụ:          ${BOLD}cd ${INSTALL_DIR} && docker compose stop${NC}"
@@ -390,6 +806,18 @@ check_status() {
         echo -e "${GREEN}✓ MeTube Web UI phản hồi HTTP 200 OK! Hoạt động hoàn hảo.${NC}"
     else
         echo -e "${YELLOW}⚠ Phản hồi HTTP: ${HTTP_CODE}. Đang khởi động hoặc có lỗi cấu hình.${NC}"
+    fi
+
+    echo -e "\n${BLUE}ℹ Kiểm tra Telegram Bot:${NC}"
+    if [ -n "$BOT_TOKEN" ]; then
+        BOT_RUNNING=$(docker ps --filter "name=ytdlp-telegram-bot" --format "{{.Status}}" || true)
+        if [ -n "$BOT_RUNNING" ]; then
+            echo -e "${GREEN}✓ Telegram Bot Container đang chạy: ${BOT_RUNNING}${NC}"
+        else
+            echo -e "${YELLOW}⚠ Telegram Bot Container chưa chạy. Hãy kiểm tra log.${NC}"
+        fi
+    else
+        echo -e "${YELLOW}ℹ Telegram Bot chưa cấu hình Token.${NC}"
     fi
 
     # Thống kê dung lượng thư mục tải về
@@ -453,8 +881,19 @@ download_video_interactive() {
 view_logs() {
     if [ -d "$INSTALL_DIR" ]; then
         cd "$INSTALL_DIR"
-        echo -e "\n${BLUE}ℹ Đang hiển thị live log MeTube (Nhấn Ctrl+C để thoát)...${NC}\n"
-        run_compose logs -f
+        echo -e "\n${BOLD}Chọn dịch vụ muốn xem Log:${NC}"
+        echo -e "   1) ${GREEN}Xem toàn bộ logs (Cả MeTube & Telegram Bot)${NC}"
+        echo -e "   2) ${BLUE}Chỉ xem logs MeTube Web UI${NC}"
+        echo -e "   3) ${CYAN}Chỉ xem logs Telegram Bot${NC}"
+        read -rp "Lựa chọn [1-3] (Mặc định: 1): " LOG_CHOICE
+        LOG_CHOICE="${LOG_CHOICE:-1}"
+
+        echo -e "\n${BLUE}ℹ Đang hiển thị live log (Nhấn Ctrl+C để thoát)...${NC}\n"
+        case "$LOG_CHOICE" in
+            1) run_compose logs -f ;;
+            2) run_compose logs -f metube ;;
+            3) run_compose logs -f telegram-bot ;;
+        esac
     else
         echo -e "${RED}✗ Chưa tìm thấy thư mục cài đặt ${INSTALL_DIR}.${NC}"
     fi
@@ -509,17 +948,18 @@ configure_cookies() {
     if [[ "$OPEN_NANO" =~ ^[Yy]$ ]]; then
         mkdir -p "$COOKIES_DIR"
         nano "$COOKIES_DIR/cookies.txt"
-        echo -e "${GREEN}✓ Đã lưu cookie. Đang khởi động lại container để áp dụng...${NC}"
+        echo -e "${GREEN}✓ Đã lưu cookie. Đang khởi động lại dịch vụ để áp dụng...${NC}"
         restart_service
     fi
 }
 
 # Cập nhật Docker Image & yt-dlp lên bản mới nhất
 update_system() {
-    echo -e "\n${BLUE}ℹ Đang kiểm tra và cập nhật Image yt-dlp / MeTube lên phiên bản mới nhất...${NC}"
+    echo -e "\n${BLUE}ℹ Đang kiểm tra và cập nhật hệ thống lên phiên bản mới nhất...${NC}"
     if [ -d "$INSTALL_DIR" ]; then
         cd "$INSTALL_DIR"
-        run_compose pull
+        run_compose pull metube
+        run_compose build --no-cache telegram-bot
         run_compose up -d --force-recreate
         install_cli_wrapper
         echo -e "${GREEN}✓ Cập nhật thành công lên bản phát hành mới nhất!${NC}\n"
@@ -532,7 +972,7 @@ update_system() {
 restart_service() {
     if [ -d "$INSTALL_DIR" ]; then
         cd "$INSTALL_DIR"
-        echo -e "\n${BLUE}ℹ Đang khởi động lại container yt-dlp / MeTube...${NC}"
+        echo -e "\n${BLUE}ℹ Đang khởi động lại toàn bộ containers yt-dlp...${NC}"
         run_compose restart
         echo -e "${GREEN}✓ Đã khởi động lại thành công!${NC}"
     fi
@@ -542,7 +982,7 @@ restart_service() {
 stop_service() {
     if [ -d "$INSTALL_DIR" ]; then
         cd "$INSTALL_DIR"
-        echo -e "\n${YELLOW}ℹ Đang dừng container yt-dlp / MeTube...${NC}"
+        echo -e "\n${YELLOW}ℹ Đang dừng container yt-dlp / MeTube / Telegram Bot...${NC}"
         run_compose stop
         echo -e "${GREEN}✓ Đã dừng dịch vụ.${NC}"
     fi
@@ -572,6 +1012,7 @@ uninstall_ytdlp() {
     else
         echo -e "${YELLOW}ℹ Giữ lại thư mục ${INSTALL_DIR}/downloads để bảo toàn file tải về.${NC}"
         rm -f "$COMPOSE_FILE" "$ENV_FILE" 2>/dev/null || true
+        rm -rf "$BOT_DIR" 2>/dev/null || true
     fi
 
     echo -e "${GREEN}✓ Đã gỡ bỏ hệ thống yt-dlp khỏi máy chủ thành công.${NC}\n"
@@ -585,20 +1026,21 @@ main_menu() {
     get_server_ips
 
     echo -e "${BOLD}Chọn tác vụ bạn muốn thực hiện:${NC}"
-    echo -e "   1) ${GREEN}${BOLD}Cài đặt & Khởi chạy Hệ thống Tải Video (MeTube Web UI + ytdl CLI)${NC}"
-    echo -e "   2) ${MAGENTA}${BOLD}Tải video ngay bằng Link từ dòng lệnh (Interactive Downloader)${NC}"
-    echo -e "   3) ${YELLOW}Kiểm tra trạng thái hệ thống & Cổng Web (${PORT})${NC}"
-    echo -e "   4) ${CYAN}Xem Live Logs tải video thời gian thực${NC}"
-    echo -e "   5) ${BLUE}Quản lý danh sách video đã tải (${DOWNLOAD_PATH})${NC}"
-    echo -e "   6) ${YELLOW}Cấu hình Cookie (Vượt bot check YouTube / FaceBook / TikTok)${NC}"
-    echo -e "   7) ${GREEN}Cập nhật yt-dlp & MeTube lên bản mới nhất${NC}"
-    echo -e "   8) Khởi động lại dịch vụ (Restart)"
-    echo -e "   9) Dừng dịch vụ (Stop)"
-    echo -e "  10) ${RED}Gỡ bỏ hệ thống hoàn toàn${NC}"
+    echo -e "   1) ${GREEN}${BOLD}Cài đặt & Khởi chạy Toàn bộ Hệ thống (Web UI + Telegram Bot + CLI)${NC}"
+    echo -e "   2) ${MAGENTA}${BOLD}Cấu hình Telegram Bot Token (Chat riêng hoặc Tag nhóm tự tải)${NC}"
+    echo -e "   3) ${YELLOW}Tải video ngay bằng Link từ dòng lệnh (Interactive Downloader)${NC}"
+    echo -e "   4) ${CYAN}Kiểm tra trạng thái hệ thống & Cổng Web (${PORT})${NC}"
+    echo -e "   5) Xem Live Logs thời gian thực (MeTube / Telegram Bot)"
+    echo -e "   6) ${BLUE}Quản lý danh sách video đã tải (${DOWNLOAD_PATH})${NC}"
+    echo -e "   7) Cấu hình Cookie (Vượt bot check YouTube / FaceBook / TikTok)"
+    echo -e "   8) ${GREEN}Cập nhật yt-dlp & MeTube lên bản mới nhất${NC}"
+    echo -e "   9) Khởi động lại dịch vụ (Restart)"
+    echo -e "  10) Dừng dịch vụ (Stop)"
+    echo -e "  11) ${RED}Gỡ bỏ hệ thống hoàn toàn${NC}"
     echo -e "   0) Thoát"
 
     echo ""
-    read -rp "Nhập lựa chọn của bạn [0-10] (Mặc định: 1): " MENU_CHOICE
+    read -rp "Nhập lựa chọn của bạn [0-11] (Mặc định: 1): " MENU_CHOICE
     MENU_CHOICE="${MENU_CHOICE:-1}"
 
     case "$MENU_CHOICE" in
@@ -606,30 +1048,33 @@ main_menu() {
             deploy_ytdlp
             ;;
         2)
-            download_video_interactive
+            configure_telegram_bot
             ;;
         3)
-            check_status
+            download_video_interactive
             ;;
         4)
-            view_logs
+            check_status
             ;;
         5)
-            manage_downloads
+            view_logs
             ;;
         6)
-            configure_cookies
+            manage_downloads
             ;;
         7)
-            update_system
+            configure_cookies
             ;;
         8)
-            restart_service
+            update_system
             ;;
         9)
-            stop_service
+            restart_service
             ;;
         10)
+            stop_service
+            ;;
+        11)
             uninstall_ytdlp
             ;;
         0)
