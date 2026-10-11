@@ -241,6 +241,7 @@ import os
 import re
 import sys
 import time
+import shutil
 import logging
 import threading
 import telebot
@@ -301,8 +302,33 @@ def extract_url(message) -> str:
     return ""
 
 
+def get_cookie_file() -> str:
+    """Kiểm tra và chuẩn bị file cookie tạm thời có quyền ghi để tránh lỗi Read-only."""
+    if not os.path.exists(COOKIES_FILE):
+        return ""
+    try:
+        has_real_cookie = False
+        with open(COOKIES_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    has_real_cookie = True
+                    break
+        if not has_real_cookie:
+            return ""
+        # Copy cookie ra thư mục /tmp có toàn quyền đọc/ghi để yt-dlp có thể cập nhật session
+        tmp_cookie = f"/tmp/cookies_{int(time.time() * 1000)}_{threading.get_ident()}.txt"
+        shutil.copyfile(COOKIES_FILE, tmp_cookie)
+        os.chmod(tmp_cookie, 0o666)
+        return tmp_cookie
+    except Exception as e:
+        logging.warning(f"Lỗi chuẩn bị cookie file: {e}")
+        return ""
+
+
 def download_and_process(chat_id: int, msg_id: int, user_id: int, url: str, is_audio: bool = False):
     status_msg = None
+    tmp_cookie = None
     try:
         status_msg = bot.send_message(
             chat_id,
@@ -321,8 +347,9 @@ def download_and_process(chat_id: int, msg_id: int, user_id: int, url: str, is_a
             'socket_timeout': 30,
         }
 
-        if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
-            ydl_opts['cookiefile'] = COOKIES_FILE
+        tmp_cookie = get_cookie_file()
+        if tmp_cookie:
+            ydl_opts['cookiefile'] = tmp_cookie
 
         if is_audio:
             ydl_opts.update({
@@ -442,6 +469,12 @@ def download_and_process(chat_id: int, msg_id: int, user_id: int, url: str, is_a
                 bot.send_message(chat_id, reply_err, reply_to_message_id=msg_id)
         else:
             bot.send_message(chat_id, reply_err, reply_to_message_id=msg_id)
+    finally:
+        if tmp_cookie and os.path.exists(tmp_cookie):
+            try:
+                os.remove(tmp_cookie)
+            except Exception:
+                pass
 
 
 @bot.message_handler(commands=['start', 'help'])
@@ -524,6 +557,7 @@ generate_docker_compose() {
 
     mkdir -p "$download_dir"
     mkdir -p "$COOKIES_DIR"
+    chmod 777 "$COOKIES_DIR" 2>/dev/null || true
     generate_bot_files
 
     # Tạo tệp cookies.txt mẫu nếu chưa có
@@ -533,7 +567,13 @@ generate_docker_compose() {
 # Dán nội dung cookie xuất từ trình duyệt (bằng extension "Get cookies.txt LOCALLY") vào đây
 # để vượt kiểm tra bot/đăng nhập của YouTube, Facebook, TikTok.
 EOF
-        chmod 644 "$COOKIES_DIR/cookies.txt"
+    fi
+    chmod 666 "$COOKIES_DIR/cookies.txt" 2>/dev/null || true
+
+    # Kiểm tra xem cookies.txt có dữ liệu thực hay chỉ có chú thích
+    local metube_cookie_env=""
+    if grep -q -v '^[[:space:]]*#' "$COOKIES_DIR/cookies.txt" 2>/dev/null && grep -q -v '^[[:space:]]*$' "$COOKIES_DIR/cookies.txt" 2>/dev/null; then
+        metube_cookie_env='- YTDL_OPTIONS={"cookiefile":"/cookies/cookies.txt"}'
     fi
 
     cat > "$COMPOSE_FILE" <<EOF
@@ -546,7 +586,7 @@ services:
       - "0.0.0.0:${port}:8081"
     volumes:
       - "${download_dir}:/downloads"
-      - "${COOKIES_DIR}:/cookies:ro"
+      - "${COOKIES_DIR}:/cookies"
     environment:
       - PUID=0
       - PGID=0
@@ -556,7 +596,7 @@ services:
       - CUSTOM_DIRS=true
       - CREATE_CUSTOM_DIRS=true
       - OUTPUT_TEMPLATE=%(title)s.%(ext)s
-      - YTDL_OPTIONS={"cookiefile":"/cookies/cookies.txt"}
+      ${metube_cookie_env}
     logging:
       driver: "json-file"
       options:
@@ -571,7 +611,7 @@ services:
     restart: unless-stopped
     volumes:
       - "${download_dir}:/downloads"
-      - "${COOKIES_DIR}:/cookies:ro"
+      - "${COOKIES_DIR}:/cookies"
     environment:
       - TELEGRAM_BOT_TOKEN=\${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_ALLOWED_USERS=\${TELEGRAM_ALLOWED_USERS:-}
@@ -603,8 +643,8 @@ install_cli_wrapper() {
 # Cho phép gọi lệnh yt-dlp tải video trực tiếp từ terminal vào thư mục hiện tại
 
 COOKIES_ARG=""
-if [ -f "/opt/ytdlp/cookies/cookies.txt" ] && [ -s "/opt/ytdlp/cookies/cookies.txt" ]; then
-    COOKIES_ARG="-v /opt/ytdlp/cookies/cookies.txt:/cookies/cookies.txt:ro --cookiefile /cookies/cookies.txt"
+if [ -f "/opt/ytdlp/cookies/cookies.txt" ] && grep -q -v '^[[:space:]]*#' "/opt/ytdlp/cookies/cookies.txt" 2>/dev/null; then
+    COOKIES_ARG="-v /opt/ytdlp/cookies:/cookies --cookiefile /cookies/cookies.txt"
 fi
 
 # Chạy container ghcr.io/alexta69/metube kèm ffmpeg
