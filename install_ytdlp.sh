@@ -435,7 +435,6 @@ def download_and_process(bot, chat_id: int, msg_id: int, user_id: int, url: str,
                     bot.send_audio(
                         chat_id,
                         audio=af,
-                        caption=f"🎵 <b>{title}</b>\n👤 Kênh: {uploader}\n📦 Dung lượng: {filesize_mb:.1f} MB",
                         reply_to_message_id=msg_id,
                         duration=duration,
                         performer=uploader,
@@ -444,14 +443,9 @@ def download_and_process(bot, chat_id: int, msg_id: int, user_id: int, url: str,
             else:
                 bot.send_chat_action(chat_id, 'upload_video')
                 with open(filepath, 'rb') as vf:
-                    caption_text = f"🎬 <b>{title}</b>\n👤 Kênh: {uploader}\n📦 Dung lượng: {filesize_mb:.1f} MB"
-                    if use_spoiler:
-                        caption_text += "\n<i>(Video đã làm mờ - chạm vào để xem)</i>"
-
                     bot.send_video(
                         chat_id,
                         video=vf,
-                        caption=caption_text,
                         reply_to_message_id=msg_id,
                         duration=duration,
                         width=width,
@@ -459,6 +453,23 @@ def download_and_process(bot, chat_id: int, msg_id: int, user_id: int, url: str,
                         supports_streaming=True,
                         has_spoiler=use_spoiler  # <-- Gửi video dạng mờ (Spoiler)
                     )
+
+            # Dọn dẹp tệp trên máy chủ ngay sau khi gửi thành công vào Telegram để giải phóng dung lượng
+            try:
+                if filepath and os.path.exists(filepath):
+                    os.remove(filepath)
+                    logging.info(f"Đã dọn dẹp file sau khi gửi Telegram: {filepath}")
+                # Xóa các tệp phụ/thumbnail tạm nếu có
+                base_path, _ = os.path.splitext(filepath)
+                for ext in ('.jpg', '.png', '.webp', '.part', '.temp', '.info.json', '.description'):
+                    extra_f = base_path + ext
+                    if os.path.exists(extra_f):
+                        try:
+                            os.remove(extra_f)
+                        except Exception:
+                            pass
+            except Exception as del_err:
+                logging.warning(f"Lỗi khi dọn dẹp file {filepath}: {del_err}")
 
             try:
                 bot.delete_message(chat_id, status_msg.message_id)
