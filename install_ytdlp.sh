@@ -350,7 +350,7 @@ def download_and_process(bot, chat_id: int, msg_id: int, user_id: int, url: str,
     try:
         status_msg = bot.send_message(
             chat_id,
-            f"⏳ <b>Đang phân tích link và tải về...</b>\n🔗 <code>{url}</code>\n<i>Vui lòng đợi giây lát!</i>",
+            "⏳ Đang phân tích link và tải về...",
             reply_to_message_id=msg_id
         )
 
@@ -419,16 +419,6 @@ def download_and_process(bot, chat_id: int, msg_id: int, user_id: int, url: str,
             use_spoiler = CURRENT_CONFIG.get('send_spoiler', False)
 
         if filesize <= MAX_TG_SIZE_BYTES:
-            try:
-                bot.edit_message_text(
-                    f"📤 <b>Đang gửi tệp lên Telegram ({filesize_mb:.1f} MB)...</b>" +
-                    (" <i>(Chế độ mờ/Spoiler)</i>" if use_spoiler and not is_audio else ""),
-                    chat_id=chat_id,
-                    message_id=status_msg.message_id
-                )
-            except Exception:
-                pass
-
             if is_audio:
                 bot.send_chat_action(chat_id, 'upload_document')
                 with open(filepath, 'rb') as af:
