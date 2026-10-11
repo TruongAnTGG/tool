@@ -26,7 +26,7 @@ COMPOSE_FILE="$INSTALL_DIR/docker-compose.yml"
 ENV_FILE="$INSTALL_DIR/.env"
 DOWNLOAD_DIR_DEFAULT="$INSTALL_DIR/downloads"
 COOKIES_DIR="$INSTALL_DIR/cookies"
-DEFAULT_PORT="8081"
+DEFAULT_PORT="8181"
 CLI_WRAPPER="/usr/local/bin/ytdl"
 CLI_WRAPPER_ALT="/usr/local/bin/yt-dlp"
 
