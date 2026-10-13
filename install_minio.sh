@@ -30,6 +30,7 @@ ENV_FILE="$INSTALL_DIR/.env"
 DEFAULT_API_PORT="9000"
 DEFAULT_CONSOLE_PORT="9001"
 DEFAULT_ROOT_USER="minioadmin"
+DEFAULT_MINIO_IMAGE="pgsty/minio:latest"
 
 # Hiển thị banner
 show_banner() {
@@ -233,6 +234,7 @@ load_config() {
     ROOT_USER="${MINIO_ROOT_USER:-$DEFAULT_ROOT_USER}"
     ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-}"
     DATA_PATH="${MINIO_DATA_DIR:-$DATA_DIR}"
+    MINIO_IMAGE="${MINIO_IMAGE:-$DEFAULT_MINIO_IMAGE}"
 }
 
 # Lưu cấu hình vào file .env
@@ -245,8 +247,46 @@ MINIO_CONSOLE_PORT=${CONSOLE_PORT}
 MINIO_ROOT_USER=${ROOT_USER}
 MINIO_ROOT_PASSWORD=${ROOT_PASSWORD}
 MINIO_DATA_DIR=${DATA_PATH}
+MINIO_IMAGE=${MINIO_IMAGE}
 EOF
     chmod 600 "$ENV_FILE"
+}
+
+# Tự động xác định và tải Docker Image tương thích cho MinIO
+resolve_minio_image() {
+    echo -e "${BLUE}ℹ Đang kiểm tra và chuẩn bị Docker Image cho MinIO...${NC}"
+    local candidate_images=(
+        "${MINIO_IMAGE}"
+        "pgsty/minio:latest"
+        "pgsty/silo:latest"
+        "cgr.dev/chainguard/minio:latest"
+    )
+
+    local target_img=""
+    for img in "${candidate_images[@]}"; do
+        [ -z "$img" ] && continue
+        # Bỏ qua image quay.io hoặc minio/minio đã bị đóng public (lỗi 401 / pull access denied)
+        if [[ "$img" == *"quay.io/minio"* ]]; then
+            continue
+        fi
+
+        echo -e "${YELLOW}⏳ Đang kiểm tra và tải Docker Image: ${BOLD}${img}${NC}...${NC}"
+        if docker pull "$img"; then
+            target_img="$img"
+            echo -e "   ${GREEN}✓ Đã sẵn sàng image: ${BOLD}${target_img}${NC}\n"
+            break
+        else
+            echo -e "   ${YELLOW}⚠ Không thể tải ${img}, đang thử image dự phòng tiếp theo...${NC}"
+        fi
+    done
+
+    if [ -z "$target_img" ]; then
+        echo -e "${RED}✗ Lỗi: Không thể tải image MinIO từ các kho Docker công khai!${NC}"
+        echo -e "${YELLOW}ℹ Vui lòng kiểm tra lại kết nối internet trên máy chủ.${NC}"
+        exit 1
+    fi
+
+    MINIO_IMAGE="$target_img"
 }
 
 # Tạo docker-compose.yml cho MinIO
@@ -254,10 +294,12 @@ generate_docker_compose() {
     mkdir -p "$INSTALL_DIR" "$DATA_PATH" "$CONFIG_DIR"
     chmod 750 "$DATA_PATH" "$CONFIG_DIR"
 
+    local current_image="${MINIO_IMAGE:-$DEFAULT_MINIO_IMAGE}"
+
     cat > "$COMPOSE_FILE" <<EOF
 services:
   minio:
-    image: quay.io/minio/minio:latest
+    image: ${current_image}
     container_name: minio-server
     restart: unless-stopped
     command: server /data --console-address ":9001" --address ":9000"
@@ -271,7 +313,7 @@ services:
       - ${DATA_PATH}:/data
       - ${CONFIG_DIR}:/root/.minio
     healthcheck:
-      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/9000' || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9000/minio/health/live || timeout 2 bash -c '</dev/tcp/127.0.0.1/9000' || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -373,6 +415,7 @@ deploy_minio() {
     fi
 
     echo -e "\n${CYAN}${BOLD}===[ BƯỚC 2: TẠO CẤU HÌNH VÀ KHỞI TẠO CONTAINER ]===${NC}\n"
+    resolve_minio_image
     save_config
     generate_docker_compose
 
